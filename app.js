@@ -433,7 +433,7 @@ function toast(msg) {
 
 /* --- GIF --- */
 async function exportGIF() {
-  const { G } = window;
+  const G = window.Gifenc;
   const { W, H } = S.layout;
   const solid = S.backdrop === 'white' ? 'white' : S.backdrop === 'black' ? 'black' : null;
   const transparent = S.hasAlpha && !solid;
@@ -519,7 +519,7 @@ function exportSheet() {
     ctx.restore();
   }
   const meta = {
-    app: 'sprite-animator', preset: S.preset, params: S.params,
+    app: 'sprite-animator', preset: S.preset, params: S.params[S.preset],
     frameWidth: W, frameHeight: H, frames: S.N, fps: S.fps,
     cols, rows, loopSeconds: +(S.N / S.fps).toFixed(3),
   };
