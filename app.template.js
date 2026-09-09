@@ -23,8 +23,11 @@ const S = {
   bgOn: true,                // remove baked background
   tol: 26,                   // flood tolerance
   trim: true,
-  islands: [],               // [{x,y,w,h,hash,area,dup}]
-  sel: 0,
+  islands: [],               // [{x,y,w,h,pix,area,dup}]
+  sel: 0,                    // single mode: chosen island index
+  mode: 'single',            // 'single' (synthetic motion) | 'frames' (real poses)
+  frameSel: null,            // frames mode: array of chosen island indexes
+  frameCrops: [],            // frames mode: [{cv,w,h}] per chosen island
   spr: null,                 // {cv, w, h} chosen, trimmed sprite
   layout: null,              // {W,H,ax,ay,pad}
   hasAlpha: false,
@@ -38,6 +41,7 @@ const S = {
   zoom: 100, pixel: false,
   busy: false,
 };
+const effN = () => (S.mode === 'frames' ? S.frameSel.length : S.N);
 
 /* ============================================================
    Motion presets.
@@ -47,6 +51,9 @@ const S = {
    pixels/degrees). Returns {x, y, rot, sx, sy}.
    ============================================================ */
 const PRESETS = {
+  none:  { label: 'None', anchor: 'center',
+    params: {},
+    fn(u, p, w, h) { return { x: 0, y: 0, rot: 0, sx: 1, sy: 1 }; } },
   idle:  { label: 'Idle', anchor: 'base',
     params: { bob:   { label: 'Bob height', min: 0, max: 18, def: 5, unit: '% h' },
               breath:{ label: 'Breath',     min: 0, max: 12, def: 4, unit: '%' } },
@@ -133,7 +140,7 @@ const PRESETS = {
                rot: rad(p.wild) * 0.5 * Math.sin(TAU * 5 * u + 0.9), sx: 1, sy: 1 };
     } },
 };
-const PRESET_ORDER = ['idle', 'bounce', 'hop', 'walk', 'run', 'float', 'sway', 'pulse', 'shake'];
+const PRESET_ORDER = ['none', 'idle', 'bounce', 'hop', 'walk', 'run', 'float', 'sway', 'pulse', 'shake'];
 
 function defaultParams(preset) {
   const o = {};
@@ -184,15 +191,15 @@ function dominantShades(cv, n = 2) {
   const x = c.getContext('2d');
   x.drawImage(cv, 0, 0, 48, 48);
   const d = x.getImageData(0, 0, 48, 48).data;
-  const counts = new Map();
+  const counts = new Map(); // quantized key -> averaged true color
   for (let i = 0; i < d.length; i += 4) {
-    // quantize a little so near-equal checker shades merge
     const key = ((d[i] >> 4) << 8) | ((d[i + 1] >> 4) << 4) | (d[i + 2] >> 4);
-    counts.set(key, (counts.get(key) || 0) + 1);
+    let e = counts.get(key);
+    if (!e) { e = { n: 0, r: 0, g: 0, b: 0 }; counts.set(key, e); }
+    e.n++; e.r += d[i]; e.g += d[i + 1]; e.b += d[i + 2];
   }
-  const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, n)
-    .map(([k]) => [((k >> 8) & 15) * 17, ((k >> 4) & 15) * 17, (k & 15) * 17]);
-  return top;
+  return [...counts.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, n)
+    .map(([, e]) => [Math.round(e.r / e.n), Math.round(e.g / e.n), Math.round(e.b / e.n)]);
 }
 function near(c, shade, tol) {
   return Math.abs(c[0] - shade[0]) <= tol && Math.abs(c[1] - shade[1]) <= tol && Math.abs(c[2] - shade[2]) <= tol;
@@ -264,31 +271,123 @@ function findIslands(cv, keep) {
   out.sort((a, b) => b.area - a.area);
   return out;
 }
-/* per-island 16x16 grayscale fingerprint (mean abs diff compares robustly
-   against JPEG noise; distinct poses differ by >> 8/255) */
+/* per-island 16x16 grayscale fingerprint, computed on the INTERIOR (inset 3px,
+   so per-cell halo/bbox jitter doesn't desync the comparison). Duplicate test
+   uses mean AND max pixel diff: identical copies match everywhere (noise-level
+   max), while distinct-but-subtle poses always differ sharply on some edge
+   (high max even when the mean is small). */
 function islandPix(cv, isl) {
+  const x = Math.min(isl.x + 3, cv.width - 8), y = Math.min(isl.y + 3, cv.height - 8);
+  const w = Math.max(8, Math.min(isl.w - 6, cv.width - x)), h = Math.max(8, Math.min(isl.h - 6, cv.height - y));
   const c = document.createElement('canvas');
   c.width = c.height = 16;
-  const x = c.getContext('2d');
-  x.imageSmoothingEnabled = true;
-  x.drawImage(cv, isl.x, isl.y, isl.w, isl.h, 0, 0, 16, 16);
-  const d = x.getImageData(0, 0, 16, 16).data;
+  const xc = c.getContext('2d');
+  xc.imageSmoothingEnabled = true;
+  xc.drawImage(cv, x, y, w, h, 0, 0, 16, 16);
+  const d = xc.getImageData(0, 0, 16, 16).data;
   const out = new Float32Array(256);
   for (let i = 0, p = 0; i < d.length; i += 4, p++) {
     out[p] = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) * (d[i + 3] / 255);
   }
   return out;
 }
-const pixDiff = (a, b) => { let s = 0; for (let i = 0; i < 256; i++) s += Math.abs(a[i] - b[i]); return s / 256; };
+/* ---- duplicate/same-pose detection ----
+   How do "identical copies" differ from "real poses"? By the SPATIAL
+   structure of their pixel differences:
+   - real poses: differences sit in a few structured regions (head tilt,
+     limb shift)  -> 3..11 diff clusters
+   - exact copies / re-renders: differences are spread uniformly as
+     surface noise or are zero -> >=12 or <=2 clusters
+   So: dup iff clusters(outside 3..11). */
+function diffClusters(a, b, thr = 28) {
+  const m = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) m[i] = Math.abs(a[i] - b[i]) > thr ? 1 : 0;
+  const seen = new Uint8Array(256);
+  let cl = 0;
+  const stack = [];
+  for (let i = 0; i < 256; i++) {
+    if (!m[i] || seen[i]) continue;
+    cl++; seen[i] = 1; stack.push(i);
+    while (stack.length) {
+      const j = stack.pop();
+      const x = j % 16, y = (j / 16) | 0;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || nx > 15 || ny < 0 || ny > 15) continue;
+        const k = ny * 16 + nx;
+        if (m[k] && !seen[k]) { seen[k] = 1; stack.push(k); }
+      }
+    }
+  }
+  return cl;
+}
 function tagDuplicates(islands) {
   for (let i = 0; i < islands.length; i++) {
     let dup = -1;
     for (let j = 0; j < i; j++) {
-      if (pixDiff(islands[i].pix, islands[j].pix) <= 8) { dup = j; break; }
+      const c = diffClusters(islands[i].pix, islands[j].pix);
+      if (c <= 2 || c >= 12) { dup = j; break; }
     }
     islands[i].dup = dup;
   }
   return islands.filter((a) => a.dup < 0).length;
+}
+
+/* ============================================================
+   Frame-strip auto-detect: when several islands of similar size
+   sit on a common baseline (a row of poses with captions below),
+   treat them as REAL animation frames (left → right).
+   Requires at least 2 distinct poses (otherwise it's just copies
+   of one pose and synthetic motion applies instead).
+   ============================================================ */
+function findFrameStrip(islands) {
+  if (islands.length < 3) return null;
+  const maxH = Math.max(...islands.map((i) => i.h));
+  const row = islands.filter((i) => i.h >= maxH * 0.55);
+  if (row.length < 3) return null;
+  const b0 = row[0].y + row[0].h;
+  const tol = Math.max(10, S.orig.h * 0.03);
+  const near = row.filter((i) => Math.abs(i.y + i.h - b0) <= tol);
+  if (near.length < 3) return null;
+  const uniq = near.filter((i) => i.dup < 0).length;
+  if (uniq < 2) return null; // all identical copies -> no real frames
+  near.sort((a, b) => a.x - b.x);
+  return near.map((i) => S.islands.indexOf(i));
+}
+/* pick a flood tolerance that actually finds figures: try 26 → 13 → 8 and
+   keep the first whose largest island looks like a real sprite (>= 4% of the
+   image). Prevents dark content that matches the bg shade from being eaten. */
+function autoTolerance() {
+  if (S.nativeAlpha || !S.bgOn) return S.tol;
+  const total = S.orig.w * S.orig.h;
+  for (const t of [26, 13, 8]) {
+    const keep = contentMask(S.orig.cv, t);
+    const isl = findIslands(S.orig.cv, keep.keep);
+    if (!isl.length) continue;
+    if (isl[0].area >= total * 0.04 && isl.length <= 120) return t;
+  }
+  return 26;
+}
+/* crop one island (bg removed, tiny pad) to its own canvas */
+function islandCrop(idx) {
+  const isl = S.islands[idx];
+  const pad = 4;
+  const x = Math.max(0, isl.x - pad), y = Math.max(0, isl.y - pad);
+  const w = Math.min(S.orig.w - x, isl.w + pad * 2), h = Math.min(S.orig.h - y, isl.h + pad * 2);
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  cv.getContext('2d').drawImage(S.orig.cv, x, y, w, h, 0, 0, w, h);
+  const keep = contentMask(cv, S.tol);
+  const id = cv.getContext('2d').getImageData(0, 0, w, h);
+  keep.fillAlpha(id.data);
+  cv.getContext('2d').putImageData(id, 0, 0);
+  return { cv, w, h };
+}
+function buildFrames() {
+  S.frameCrops = S.frameSel.map(islandCrop);
+  let mw = 0, mh = 0;
+  for (const f of S.frameCrops) { if (f.w > mw) mw = f.w; if (f.h > mh) mh = f.h; }
+  S.frameBox = { w: mw, h: mh };
 }
 
 /* ============================================================
@@ -318,8 +417,14 @@ function buildSprite() {
   S.hasAlpha = any;
 }
 function computeLayout() {
-  if (!S.spr) { S.layout = null; return; }
-  const { w, h } = S.spr, preset = PRESETS[S.preset];
+  if (!S.spr && S.mode !== 'frames') { S.layout = null; return; }
+  const { w, h } = S.spr || { w: S.frameBox.w, h: S.frameBox.h };
+  if (S.mode === 'frames') {
+    const M = 6;
+    S.layout = { W: w + M * 2, H: h + M * 2, ax: w / 2 + M, ay: h / 2 + M, pad: M };
+    return;
+  }
+  const preset = PRESETS[S.preset];
   const p = resolveParams(S.params[S.preset], S.preset, w, h);
   const anchorBase = preset.anchor === 'base';
   // scan a dense grid of the continuous motion; measures how far the sprite
@@ -347,7 +452,16 @@ function computeLayout() {
    Rendering
    ============================================================ */
 function drawAt(ctx, u, ox = 0, oy = 0) {
-  const { spr, layout } = S;
+  const { layout } = S;
+  if (S.mode === 'frames') {
+    const n = effN();
+    if (!n) return;
+    const f = S.frameCrops[Math.min(n - 1, Math.floor(u * n)) % n];
+    // bottom-align frames so feet stay on the same baseline
+    ctx.drawImage(f.cv, layout.ax + ox - f.w / 2, layout.pad + S.frameBox.h - f.h);
+    return;
+  }
+  const { spr } = S;
   const preset = PRESETS[S.preset];
   const p = resolveParams(S.params[S.preset], S.preset, spr.w, spr.h);
   const t = preset.fn(u, p, spr.w, spr.h);
@@ -375,7 +489,7 @@ const pvCtx = pvCanvas.getContext('2d');
 let rafT0 = 0;
 function frameTick(now) {
   requestAnimationFrame(frameTick);
-  const P = S.N / S.fps; // seconds per loop (also drives preview pacing)
+  const P = effN() / S.fps; // seconds per loop (also drives preview pacing)
   if (S.playing) {
     const dt = (now - (rafT0 || now)) / 1000;
     rafT0 = now;
@@ -386,14 +500,15 @@ function frameTick(now) {
 function renderPreview() {
   const { layout } = S;
   if (!layout) return;
-  const u = S.smoothMode ? S.u : (Math.floor(S.u * S.N + 1e-6) % S.N) / S.N;
+  const N = effN();
+  const u = S.smoothMode ? S.u : (Math.floor(S.u * N + 1e-6) % N) / N;
   if (pvCanvas.width !== layout.W) { pvCanvas.width = layout.W; pvCanvas.height = layout.H; }
   pvCtx.clearRect(0, 0, layout.W, layout.H);
   drawAt(pvCtx, u);
-  const k = Math.floor(S.u * S.N + 1e-6) % S.N;
+  const k = Math.floor(S.u * N + 1e-6) % N;
   $('#pvInfo').textContent =
-    `${S.preset} · frame ${k + 1}/${S.N} @ ${S.fps} fps → ${(1000 / S.fps).toFixed(0)} ms/frame` +
-    (S.smoothMode ? '' : ' (frames)');
+    `${S.preset} · frame ${k + 1}/${N} @ ${S.fps} fps → ${(1000 / S.fps).toFixed(0)} ms/frame` +
+    (S.mode === 'frames' ? ' (real poses)' : S.smoothMode ? '' : ' (frames)');
 }
 function applyStage() {
   const stage = $('#stage');
@@ -435,7 +550,7 @@ async function exportGIF() {
   const transparent = S.hasAlpha && !solid;
   const gif = G.GIFEncoder();
   let delay = Math.max(20, Math.round(1000 / S.fps));
-  const uVals = [...Array(S.N)].map((_, k) => k / S.N);
+  const uVals = [...Array(effN())].map((_, k) => k / effN());
   let first = true;
   for (const u of uVals) {
     const f = makeFrameCanvas(solid);
@@ -482,7 +597,7 @@ async function exportVideo() {
   rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
   const done = new Promise((res) => { rec.onstop = res; });
   rec.start();
-  const P = S.N / S.fps;
+  const P = effN() / S.fps;
   const t0 = performance.now();
   await new Promise((res) => {
     (function render() {
@@ -502,13 +617,14 @@ async function exportVideo() {
 /* --- sprite sheet + frames.json --- */
 function exportSheet() {
   const { W, H } = S.layout;
-  const cols = clamp(S.cols, 1, S.N);
-  const rows = Math.ceil(S.N / cols);
+  const N = effN();
+  const cols = clamp(S.cols, 1, N);
+  const rows = Math.ceil(N / cols);
   const cv = document.createElement('canvas');
   cv.width = W * cols; cv.height = H * rows;
   const ctx = cv.getContext('2d');
-  for (let k = 0; k < S.N; k++) {
-    const u = k / S.N;
+  for (let k = 0; k < N; k++) {
+    const u = k / N;
     ctx.save();
     ctx.translate((k % cols) * W, Math.floor(k / cols) * H);
     drawAt(ctx, u);
@@ -516,8 +632,9 @@ function exportSheet() {
   }
   const meta = {
     app: 'sprite-animator', preset: S.preset, params: S.params[S.preset],
-    frameWidth: W, frameHeight: H, frames: S.N, fps: S.fps,
-    cols, rows, loopSeconds: +(S.N / S.fps).toFixed(3),
+    mode: S.mode,
+    frameWidth: W, frameHeight: H, frames: N, fps: S.fps,
+    cols, rows, loopSeconds: +(N / S.fps).toFixed(3),
   };
   return {
     sheet: new Promise((res) => cv.toBlob((b) => res(b), 'image/png')),
@@ -545,6 +662,7 @@ async function loadBlob(blob, name) {
     S.nativeAlpha = anyA;
     $('#chkBg').checked = !anyA;
     updateTolVisibility();
+    S._autoTol = true;
     processCurrent();
     S.u = 0; S.playing = true; rafT0 = 0;
     $('#scrub').value = 0;
@@ -555,6 +673,11 @@ async function loadBlob(blob, name) {
 }
 function processCurrent() {
   if (!S.orig) return;
+  if (S._autoTol) {
+    S.tol = autoTolerance();
+    $('#rangeTol').value = S.tol; $('#valTol').textContent = S.tol;
+    S._autoTol = false;
+  }
   const keep = contentMask(S.orig.cv, S.tol);
   // apply alpha to a copy used for island cropping/hashes
   const wk = document.createElement('canvas');
@@ -569,37 +692,73 @@ function processCurrent() {
   for (const isl of islands) isl.pix = islandPix(wk, isl);
   const uniq = tagDuplicates(islands);
   S.islands = islands; S.sel = 0;
+  // frames mode: auto-detect a strip of real poses (needs >=2 distinct)
+  const strip = findFrameStrip(islands);
+  if (strip && strip.length >= 2) {
+    S.mode = 'frames'; S.frameSel = strip; buildFrames();
+    S.preset = 'none'; setPreset('none');
+  } else {
+    S.mode = 'single'; S.frameSel = null; S.frameCrops = [];
+  }
   buildSprite();
   computeLayout();
   renderIslands(uniq);
   syncExportUI();
   applyStage();
 }
-function renderIslands(uniq) {
+function renderIslands(_u) {
+  const uniq = _u !== undefined ? _u : S.islands.filter((x) => x.dup < 0).length;
   const row = $('#islandsRow');
   row.innerHTML = '';
-  $('#islandsWrap').style.display = S.islands.length > 1 ? 'block' : 'none';
-  $('#dupNote').classList.toggle('show', S.islands.length > 1 && uniq === 1);
-  if (S.islands.length > 1 && uniq === 1) {
+  const showRow = S.islands.length > 1 && (S.mode === 'frames' || S.islands.length > 2);
+  $('#islandsWrap').style.display = showRow ? 'block' : 'none';
+  const manyCopies = S.islands.length >= 4 && uniq <= 3 && uniq < S.islands.length;
+  $('#dupNote').classList.toggle('show', manyCopies);
+  if (manyCopies) {
     $('#dupNote').textContent =
-      `${S.islands.length} near-identical copies detected — all show the same pose ` +
-      `(typical of GPT Images "animation frames"). The animator synthesizes real motion from one copy.`;
+      `${S.islands.length} figures detected but only ${uniq} look distinct — most are copies of the same pose ` +
+      `(typical of GPT Images "animation frames"). The animator synthesizes real motion from one copy; ` +
+      `use the chips to rotate through figures.`;
   }
   S.islands.forEach((isl, i) => {
+    const on = S.mode === 'frames' ? S.frameSel.includes(i) : i === S.sel;
     const b = document.createElement('button');
-    b.className = 'isl' + (i === S.sel ? ' sel' : '');
+    b.className = 'isl' + (on ? ' sel' : '');
     b.title = `Island ${i + 1}: ${isl.w}×${isl.h}`;
     const img = document.createElement('img');
     img.src = cropDataURL(isl);
     const lab = document.createElement('small');
-    lab.textContent = isl.dup >= 0 ? `copy of #${isl.dup + 1}` : `#${i + 1} · ${isl.w}×${isl.h}`;
+    const dupTag = isl.dup >= 0 ? `copy of #${isl.dup + 1}` : `frame #${i + 1}`;
+    lab.textContent = dupTag + ` · ${isl.w}×${isl.h}`;
     b.append(img, lab);
-    b.onclick = () => { S.sel = i; buildSprite(); computeLayout(); renderIslands(S.islands.filter((x) => x.dup < 0).length); syncExportUI(); applyStage(); };
+    b.onclick = () => {
+      if (S.mode === 'frames') {
+        const idx = S.frameSel.indexOf(i);
+        if (idx >= 0) {
+          if (S.frameSel.length <= 2) { toast('Need ≥ 2 frames — deselect another first'); return; }
+          S.frameSel.splice(idx, 1);
+        } else S.frameSel.push(i);
+        S.frameSel.sort((a, c) => S.islands[a].x - S.islands[c].x);
+        buildFrames(); computeLayout(); renderIslands(uniq); syncExportUI(); applyStage();
+      } else {
+        S.sel = i; buildSprite(); computeLayout(); renderIslands(uniq); syncExportUI(); applyStage();
+      }
+    };
     row.appendChild(b);
   });
+  const modeTxt = S.mode === 'frames'
+    ? `Frame mode: playing ${S.frameSel.length} detected poses in order (click chips to exclude/include — manual set).`
+    : `Single sprite mode — synthetic motion. Click a chip to switch which sprite to animate.`;
+  $('#islandsRow').insertAdjacentHTML('beforeend',
+    `<div style="width:100%;font-size:12px;color:var(--mut);padding-top:2px">${modeTxt}</div>`);
+  $('#frameModeRow').style.display = S.islands.length >= 2 ? 'flex' : 'none';
+  $('#btnFramesOn').style.display = S.mode === 'single' ? '' : 'none';
+  $('#btnFramesOff').style.display = S.mode === 'frames' ? '' : 'none';
   $('#srcInfo').textContent =
     `Source ${S.orig.w}×${S.orig.h}${S.nativeAlpha ? ' · transparent PNG' : ''}` +
-    ` → sprite ${S.spr.w}×${S.spr.h}, ${S.islands.length} island${S.islands.length > 1 ? 's' : ''} detected`;
+    (S.mode === 'frames'
+      ? ` → ${S.frameSel.length} frames detected (largest figures, ${S.frameBox.w}×${S.frameBox.h})`
+      : ` → sprite ${S.spr.w}×${S.spr.h}, ${S.islands.length} island${S.islands.length > 1 ? 's' : ''} detected`);
   $('#sizeInfo').textContent = `frame canvas ${S.layout.W}×${S.layout.H}px`;
 }
 function cropDataURL(isl) {
@@ -652,15 +811,18 @@ function buildParams() {
   }
 }
 function syncExportUI() {
-  $('#valFps').textContent = S.fps; $('#valN').textContent = S.N;
-  $('#valCols').textContent = Math.min(S.cols, S.N);
-  $('#rangeCols').max = Math.max(1, S.N);
-  $('#rangeCols').value = Math.min(S.cols, S.N);
-  $('#scrub').max = S.N - 1;
+  const N = effN();
+  $('#valFps').textContent = S.fps;
+  $('#valN').textContent = S.mode === 'frames' ? N + ' (from image)' : N;
+  $('#rangeN').disabled = S.mode === 'frames';
+  $('#rangeCols').max = Math.max(1, N);
+  $('#rangeCols').value = Math.min(S.cols, N);
+  $('#valCols').textContent = Math.min(S.cols, N);
+  $('#scrub').max = N - 1;
   $('#frameSizeInfo').textContent = S.layout ? `${S.layout.W}×${S.layout.H}px` : '—';
-  const P = S.N / S.fps;
+  const P = N / S.fps;
   $('#expNote').textContent = S.layout
-    ? `${S.N} frames × ${(1000 / S.fps).toFixed(0)} ms = ${P.toFixed(2)} s per loop · sheet ${Math.min(S.cols, S.N)}×${Math.ceil(S.N / Math.min(S.cols, S.N))}` +
+    ? `${N} frames × ${(1000 / S.fps).toFixed(0)} ms = ${P.toFixed(2)} s per loop · sheet ${Math.min(S.cols, N)}×${Math.ceil(N / Math.min(S.cols, N))}` +
       (S.hasAlpha ? ' · GIF keeps transparency' : '')
     : '';
 }
@@ -682,6 +844,21 @@ function bindUI() {
   };
   fi.onchange = () => { if (fi.files[0]) loadBlob(fi.files[0], fi.files[0].name); fi.value = ''; };
   $('#btnUpload').onclick = () => fi.click();
+  $('#btnFramesOn').onclick = () => {
+    if (S.islands.length < 2) return;
+    const maxA = Math.max(...S.islands.map((i) => i.area));
+    S.mode = 'frames';
+    S.frameSel = S.islands.map((_, idx) => idx)
+      .filter((idx) => S.islands[idx].area >= maxA * 0.35);
+    if (S.frameSel.length < 2) S.frameSel = [0, 1];
+    S.frameSel.sort((a, c) => S.islands[a].x - S.islands[c].x);
+    S.preset = 'none'; setPreset('none');
+    buildFrames(); computeLayout(); renderIslands(); syncExportUI(); applyStage();
+  };
+  $('#btnFramesOff').onclick = () => {
+    S.mode = 'single'; S.frameSel = null; S.frameCrops = [];
+    buildSprite(); computeLayout(); renderIslands(); syncExportUI(); applyStage();
+  };
   $('#btnDemo').onclick = async () => {
     const b64 = DEMO_B64;
     const bin = atob(b64), u8 = new Uint8Array(bin.length);
@@ -693,7 +870,7 @@ function bindUI() {
     if (it) loadBlob(it.getAsFile(), 'pasted.png');
   });
   $('#chkBg').onchange = () => { S.bgOn = $('#chkBg').checked; updateTolVisibility(); processCurrent(); };
-  $('#rangeTol').oninput = () => { S.tol = +$('#rangeTol').value; $('#valTol').textContent = S.tol; };
+  $('#rangeTol').oninput = () => { S.tol = +$('#rangeTol').value; S._autoTol = false; $('#valTol').textContent = S.tol; };
   $('#rangeTol').onchange = () => { processCurrent(); };
   $('#chkTrim').onchange = () => { S.trim = $('#chkTrim').checked; processCurrent(); };
   $('#rangeTempo').oninput = () => { S.tempo = +$('#rangeTempo').value / 100; $('#valTempo').textContent = S.tempo.toFixed(2) + '×'; };
@@ -703,8 +880,8 @@ function bindUI() {
   $('#btnPlay').onclick = () => { S.playing = !S.playing; $('#btnPlay').textContent = S.playing ? '⏸' : '▶'; rafT0 = 0; };
   $('#btnPrev').onclick = () => step(-1);
   $('#btnNext').onclick = () => step(1);
-  $('#scrub').oninput = () => { S.u = +$('#scrub').value / S.N; if (!S.playing) renderPreview(); };
-  function step(d) { S.u = (S.u + d / S.N + 1) % 1; $('#scrub').value = Math.floor(S.u * S.N) % S.N; renderPreview(); }
+  $('#scrub').oninput = () => { S.u = +$('#scrub').value / effN(); if (!S.playing) renderPreview(); };
+  function step(d) { const N = effN(); S.u = (S.u + d / N + 1) % 1; $('#scrub').value = Math.floor(S.u * N) % N; renderPreview(); }
   $$('#modeSeg button').forEach((b) => {
     b.onclick = () => {
       S.smoothMode = b.dataset.m === 'smooth';
@@ -761,6 +938,7 @@ init();
 window.__SA = {
   load: (blob, name) => loadBlob(blob, name),
   setPreset, state: () => ({ preset: S.preset, params: S.params[S.preset], fps: S.fps, N: S.N,
+    mode: S.mode, frameSel: S.frameSel ? S.frameSel.length : 0, tol: S.tol,
     islands: S.islands.length, uniq: S.islands.filter(i => i.dup < 0).length, sel: S.sel,
     spr: S.spr ? { w: S.spr.w, h: S.spr.h } : null,
     layout: S.layout ? { W: S.layout.W, H: S.layout.H } : null,
