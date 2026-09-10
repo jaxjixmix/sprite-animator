@@ -1022,8 +1022,13 @@ function renderTimeline() {
 }
 function syncTimelineSel() {
   $$('#timeline .tl-block').forEach((b) => b.classList.toggle('sel', +b.dataset.k === S.selFrame));
-  const cur = $(`#timeline .tl-block[data-k="${S.selFrame}"]`);
-  if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+function scrollTimelineTo(k) {
+  const tl = $('#timeline');
+  const b = $(`#timeline .tl-block[data-k="${k}"]`);
+  if (!tl || !b || tl.scrollWidth <= tl.clientWidth) return;
+  const target = b.offsetLeft - (tl.clientWidth - b.offsetWidth) / 2;
+  tl.scrollTo({ left: Math.max(0, Math.min(target, tl.scrollWidth - tl.clientWidth)), behavior: 'smooth' });
 }
 function highlightTimeline(idx) {
   if (idx === S._lastHi) return;
@@ -1040,6 +1045,7 @@ function selectFrame(k) {
   $('#btnPlay').textContent = '▶';
   buildFrameEditor();
   syncTimelineSel();
+  scrollTimelineTo(S.selFrame);
   renderPreview();
 }
 function buildFrameEditor() {
