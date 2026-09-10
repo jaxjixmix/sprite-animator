@@ -237,7 +237,13 @@ function dominantShades(cv, n = 2) {
 function near(c, shade, tol) {
   return Math.abs(c[0] - shade[0]) <= tol && Math.abs(c[1] - shade[1]) <= tol && Math.abs(c[2] - shade[2]) <= tol;
 }
-/* returns Uint8 keep-mask: 1 = opaque/content */
+/* returns Uint8 keep-mask: 1 = opaque/content
+   Background removal must handle ENCLOSED flat areas too: a panel-bordered sheet
+   (grid lines around every cell) seals its white background away from the image
+   border, so a border-only flood removes nothing. Instead we label every
+   bg-coloured component and drop the ones that are (a) border-connected, or
+   (b) large (>= 0.4% of the image) — which keeps small bg-coloured content like
+   white eyes. */
 function contentMask(cv, tol) {
   const { width: w, height: h } = cv;
   const ctx = cv.getContext('2d');
@@ -246,25 +252,35 @@ function contentMask(cv, tol) {
   const alphaNative = S.nativeAlpha;
   if (!alphaNative && S.bgOn) {
     const shades = dominantShades(cv);
-    const q = new Int32Array(w * h).fill(-1);   // -1 = unvisited/content, 1 = bg reached
-    const stack = [];
-    const push = (i) => { if (q[i] < 0) { q[i] = 1; stack.push(i); } };
-    for (let x = 0; x < w; x++) { push(x); push((h - 1) * w + x); }
-    for (let y = 0; y < h; y++) { push(y * w); push(y * w + w - 1); }
-    while (stack.length) {
-      const i = stack.pop();
-      const px = i * 4;
-      const c = [d[px], d[px + 1], d[px + 2]];
-      if (!shades.some((s) => near(c, s, tol))) continue; // content edge reached
-      const cx = i % w, cy = (i / w) | 0;
-      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-        if (!dx && !dy) continue;
-        const nx = cx + dx, ny = cy + dy;
-        if (nx >= 0 && nx < w && ny >= 0 && ny < h) push(ny * w + nx);
-      }
+    const bgLike = new Uint8Array(w * h);
+    for (let i = 0, p = 0; i < bgLike.length; i++, p += 4) {
+      bgLike[i] = shades.some((s) => near([d[p], d[p + 1], d[p + 2]], s, tol)) ? 1 : 0;
     }
-    // keep = 1 means CONTENT (pixels the flood never reached)
-    for (let i = 0; i < keep.length; i++) if (q[i] === -1) keep[i] = 1;
+    const minArea = Math.max(600, Math.round(w * h * 0.004));
+    const seen = new Uint8Array(w * h);
+    const buf = new Int32Array(w * h);
+    const stack = [];
+    for (let start = 0; start < bgLike.length; start++) {
+      if (!bgLike[start] || seen[start]) continue;
+      let n = 0, touchesBorder = false;
+      seen[start] = 1; stack.push(start);
+      while (stack.length) {
+        const i = stack.pop();
+        buf[n++] = i;
+        const cx = i % w, cy = (i / w) | 0;
+        if (cx === 0 || cy === 0 || cx === w - 1 || cy === h - 1) touchesBorder = true;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          if (!dx && !dy) continue;
+          const nx = cx + dx, ny = cy + dy;
+          if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+          const k = ny * w + nx;
+          if (bgLike[k] && !seen[k]) { seen[k] = 1; stack.push(k); }
+        }
+      }
+      // big or border-connected bg-coloured areas are background; small ones are content
+      if (!touchesBorder && n < minArea) for (let i = 0; i < n; i++) keep[buf[i]] = 1;
+    }
+    for (let i = 0; i < keep.length; i++) if (!bgLike[i]) keep[i] = 1;
     return { keep, alpha: false, fillAlpha(d) {
       for (let i = 0; i < keep.length; i++) if (!keep[i]) { d[i * 4 + 3] = 0; }
     } };
@@ -299,7 +315,15 @@ function findIslands(cv, keep) {
       }
     }
     if (area < 8 || (maxX - minX) < 3 || (maxY - minY) < 3) continue;
-    out.push({ x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1, area });
+    // drop "line-like" components (panel borders, rules, long thin frames): a real
+    // sprite fills a decent share of its bounding box; a border lattice does not —
+    // and a lattice typically spans nearly the whole image
+    const bw = maxX - minX + 1, bh = maxY - minY + 1;
+    const fill = area / (bw * bh);
+    const spansAll = bw > w * 0.6 && bh > h * 0.6;
+    if (fill < 0.05 && (bw > 60 || bh > 60)) continue;
+    if (spansAll && fill < 0.2) continue;
+    out.push({ x: minX, y: minY, w: bw, h: bh, area });
   }
   out.sort((a, b) => b.area - a.area);
   return out;
@@ -376,30 +400,72 @@ function tagDuplicates(islands) {
 function findFrameStrip(islands) {
   if (islands.length < 3) return null;
   const maxH = Math.max(...islands.map((i) => i.h));
-  const row = islands.filter((i) => i.h >= maxH * 0.55);
-  if (row.length < 3) return null;
-  const b0 = row[0].y + row[0].h;
-  const tol = Math.max(10, S.orig.h * 0.03);
-  const near = row.filter((i) => Math.abs(i.y + i.h - b0) <= tol);
-  if (near.length < 3) return null;
-  const uniq = near.filter((i) => i.dup < 0).length;
+  // candidate figures: comparable size (a strip of poses, or the cells of a grid)
+  const cands = islands.filter((i) => i.h >= maxH * 0.55);
+  if (cands.length < 3) return null;
+  // group into columns by horizontal overlap -> rejects stray small blobs
+  const cols = [];
+  for (const isl of [...cands].sort((a, b) => a.x - b.x)) {
+    const hit = cols.find((c) => {
+      const ov = Math.min(c.x + c.w, isl.x + isl.w) - Math.max(c.x, isl.x);
+      return ov > Math.min(c.w, isl.w) * 0.35;
+    });
+    if (hit) { hit.items.push(isl); hit.x = isl.x; hit.w = isl.w; }
+    else cols.push({ x: isl.x, w: isl.w, items: [isl] });
+  }
+  if (cols.length < 3) return null;
+  const flat = cols.flatMap((c) => c.items);
+  const uniq = flat.filter((i) => i.dup < 0).length;
   if (uniq < 2) return null; // all identical copies -> no real frames
-  near.sort((a, b) => a.x - b.x);
-  return near.map((i) => S.islands.indexOf(i));
+  // one row of poses -> order left to right; a multi-row grid -> row-major
+  const centers = flat.map((i) => i.y + i.h / 2).sort((a, b) => a - b);
+  const med = centers[centers.length >> 1];
+  const bandTol = Math.max(14, med * 0.5);
+  const bands = [];
+  for (const isl of [...flat].sort((a, b) => (a.y + a.h / 2) - (b.y + b.h / 2))) {
+    const cy = isl.y + isl.h / 2;
+    const b = bands.find((x) => Math.abs(x.c - cy) <= bandTol);
+    if (b) { b.items.push(isl); b.c = (b.c * (b.items.length - 1) + cy) / b.items.length; }
+    else bands.push({ c: cy, items: [isl] });
+  }
+  const ordered = bands.length === 1
+    ? [...flat].sort((a, b) => a.x - b.x)
+    : bands.sort((a, b) => a.c - b.c).flatMap((b) => b.items.sort((a, b2) => a.x - b2.x));
+  return ordered.map((i) => S.islands.indexOf(i));
 }
-/* pick a flood tolerance that actually finds figures: try 26 → 13 → 8 and
-   keep the first whose largest island looks like a real sprite (>= 4% of the
-   image). Prevents dark content that matches the bg shade from being eaten. */
+/* pick a flood tolerance that actually finds figures. Score each candidate by how
+   many FIGURE-LIKE islands it yields (a sprite occupies a meaningful share of the
+   image and fills a decent part of its own box). A fixed "largest island >= 4%"
+   rule fails on multi-figure sheets, where each pose is only ~3% of the image. */
 function autoTolerance() {
   if (S.nativeAlpha || !S.bgOn) return S.tol;
-  const total = S.orig.w * S.orig.h;
-  for (const t of [26, 13, 8]) {
+  const W = S.orig.w, H = S.orig.h;
+  // a real figure is a BIG blob (>= 1.5% of the sheet) that fills its own box;
+  // scoring by count alone rewards fragmenting the art into small pieces
+  const figureLike = (isl) =>
+    isl.area / (W * H) >= 0.015 && isl.h >= H * 0.12 && isl.h <= H * 0.85 &&
+    isl.w >= 6 && isl.area / (isl.w * isl.h) >= 0.15;
+  let best = null;
+  for (const t of [34, 26, 13, 8]) {
     const keep = contentMask(S.orig.cv, t);
     const isl = findIslands(S.orig.cv, keep.keep);
     if (!isl.length) continue;
-    if (isl[0].area >= total * 0.04 && isl.length <= 120) return t;
+    const score = isl.filter(figureLike).length;
+    const maxArea = isl[0] ? isl[0].area : 0;
+    if (!best || score > best.score || (score === best.score && maxArea > best.maxArea)) {
+      best = { tol: t, score, maxArea };
+    }
   }
-  return 26;
+  if (!best) return 26;
+  // nothing figure-like at any tolerance: fall back to the old "one big sprite" rule
+  if (best.score === 0) {
+    for (const t of [26, 13, 8]) {
+      const isl = findIslands(S.orig.cv, contentMask(S.orig.cv, t).keep);
+      if (isl.length && isl[0].area >= W * H * 0.04) return t;
+    }
+    return 26;
+  }
+  return best.tol;
 }
 /* crop one island (bg removed, tiny pad) to its own canvas */
 function islandCrop(idx) {
@@ -435,7 +501,50 @@ function bboxOfMask(keep, w, h) {
   }
   return maxX < 0 ? null : { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
 }
-/* one grid cell -> frame crop (largest figure, or everything) */
+/* keep ONLY the largest connected blob of a canvas: a bbox crop still contains
+   neighbouring blobs inside the rectangle (panel numbers, captions) — those must
+   be erased, not merely excluded from the bounding box. */
+function keepOnlyLargestBlob(cv, tol) {
+  const w = cv.width, h = cv.height;
+  const ctx = cv.getContext('2d');
+  const mask = contentMask(cv, tol).keep;
+  const seen = new Uint8Array(w * h);
+  const buf = new Int32Array(w * h);
+  const stack = [];
+  let bestStart = -1, bestN = 0, bestBuf = null;
+  for (let start = 0; start < mask.length; start++) {
+    if (!mask[start] || seen[start]) continue;
+    let n = 0;
+    seen[start] = 1; stack.push(start);
+    while (stack.length) {
+      const i = stack.pop();
+      buf[n++] = i;
+      const cx = i % w, cy = (i / w) | 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue;
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+        const k = ny * w + nx;
+        if (mask[k] && !seen[k]) { seen[k] = 1; stack.push(k); }
+      }
+    }
+    if (n > bestN) { bestN = n; bestStart = start; bestBuf = buf.slice(0, n); }
+  }
+  if (bestStart < 0 || !bestBuf) return null;
+  const keepSet = new Uint8Array(w * h);
+  for (let i = 0; i < bestBuf.length; i++) keepSet[bestBuf[i]] = 1;
+  let minX = w, minY = h, maxX = -1, maxY = -1;
+  for (let i = 0; i < bestBuf.length; i++) {
+    const x = bestBuf[i] % w, y = (bestBuf[i] / w) | 0;
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+  }
+  const id = ctx.getImageData(0, 0, w, h);
+  for (let i = 0; i < keepSet.length; i++) if (!keepSet[i]) id.data[i * 4 + 3] = 0;
+  ctx.putImageData(id, 0, 0);
+  return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+}
+/* one grid cell -> frame crop (largest figure only, other blobs erased) */
 function cellCrop(cell) {
   const cw = cell.w, chh = cell.h;
   const tmp = document.createElement('canvas');
@@ -448,8 +557,9 @@ function cellCrop(cell) {
   tctx.putImageData(id, 0, 0);
   let box = null;
   if (S.grid.keepLargest) {
-    const isl = findIslands(tmp, keep.keep);
-    if (isl.length) box = { x: isl[0].x, y: isl[0].y, w: isl[0].w, h: isl[0].h };
+    // isolate the figure blob: erases numbers/captions that fall inside its rectangle
+    const big = keepOnlyLargestBlob(tmp, S.tol);
+    if (big) box = big;
   }
   if (!box) box = bboxOfMask(keep.keep, cw, chh);
   if (!box) return { cv: tmp, w: cw, h: chh };
@@ -475,11 +585,24 @@ function sliceGrid() {
     cw = Math.floor((S.orig.w - g.ox) / cols);
     ch = Math.floor((S.orig.h - g.oy) / rows);
   }
+  // cells either come from explicit boundary cuts (auto-detected rules) or an even grid
+  const xs = (g.vx && g.vx.length) ? [0, ...g.vx, S.orig.w] : null;
+  const ys = (g.hy && g.hy.length) ? [0, ...g.hy, S.orig.h] : null;
+  if (xs) cols = xs.length - 1;
+  if (ys) rows = ys.length - 1;
   const cells = [];
-  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
-    const x = g.ox + c * cw, y = g.oy + r * ch;
-    const w = Math.min(cw, S.orig.w - x), h = Math.min(ch, S.orig.h - y);
-    if (w >= 8 && h >= 8) cells.push({ x, y, w, h });
+  if (xs && ys) {
+    for (let r = 0; r < ys.length - 1; r++) for (let c = 0; c < xs.length - 1; c++) {
+      const x = xs[c] + 3, y = ys[r] + 3;                       // inset past the rule line
+      const w = xs[c + 1] - xs[c] - 6, h = ys[r + 1] - ys[r] - 6;
+      if (w >= 8 && h >= 8) cells.push({ x, y, w, h });
+    }
+  } else {
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+      const x = g.ox + c * cw, y = g.oy + r * ch;
+      const w = Math.min(cw, S.orig.w - x), h = Math.min(ch, S.orig.h - y);
+      if (w >= 8 && h >= 8) cells.push({ x, y, w, h });
+    }
   }
   if (!cells.length) { toast('⚠ Grid produced no cells — check size/offsets'); return; }
   S.frameSource = 'grid';
@@ -493,6 +616,46 @@ function sliceGrid() {
   S.preset = 'none'; setPreset('none');
   computeLayout(); renderIslands(); refreshAll({ thumbs: true });
   toast(`Sliced ${cells.length} frames (${cols}×${rows})`);
+}
+
+/* Detect a sheet's own rules (the thin lines around panels) and derive a grid.
+   Only attempted on light-background sheets: on a dark-bg sheet the "dark" test
+   would flag everything. Returns cut positions in px (excluding outer borders). */
+function detectGridLines(cv) {
+  const { width: w, height: h } = cv;
+  const d = cv.getContext('2d').getImageData(0, 0, w, h).data;
+  const colFrac = new Float32Array(w), rowFrac = new Float32Array(h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const p = (y * w + x) * 4;
+      const lum = 0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2];
+      if (lum < 150) { colFrac[x]++; rowFrac[y]++; }
+    }
+  }
+  for (let x = 0; x < w; x++) colFrac[x] /= h;
+  for (let y = 0; y < h; y++) rowFrac[y] /= w;
+  const cuts = (arr, len) => {
+    const out = [];
+    const maxRun = Math.max(8, Math.round(len * 0.025)); // a rule is thin; a character column is wide
+    let i = 0;
+    while (i < len) {
+      if (arr[i] > 0.85) {
+        let j = i;
+        while (j < len && arr[j] > 0.85) j++;
+        if (j - i <= maxRun) out.push(Math.round((i + j - 1) / 2));
+        i = j;
+      } else i++;
+    }
+    return out;
+  };
+  return { vx: cuts(colFrac, w), hy: cuts(rowFrac, h) };
+}
+/* is this a light-background sheet? (dark bg would break the rule test) */
+function bgIsLight(cv) {
+  const shades = dominantShades(cv, 1);
+  if (!shades.length) return false;
+  const [r, g, b] = shades[0];
+  return (0.299 * r + 0.587 * g + 0.114 * b) > 170;
 }
 
 /* ============================================================
@@ -802,6 +965,24 @@ function processCurrent() {
     S.tol = autoTolerance();
     $('#rangeTol').value = S.tol; $('#valTol').textContent = S.tol;
     S._autoTol = false;
+  }
+  // AUTO GRID: sheets that draw their own panel rules (very common for AI pose
+  // sheets) defeat island detection — the rules bind everything into one blob.
+  // Detect the rules, derive the grid, and slice the panels instead.
+  if (S.grid.mode === 'auto' && !S.nativeAlpha && S.bgOn && bgIsLight(S.orig.cv)) {
+    const lines = detectGridLines(S.orig.cv);
+    // cuts hard against the image edge are the sheet's outer border, not a panel divider
+    const inner = (arr, len) => arr.filter((v) => v > len * 0.015 && v < len * 0.985);
+    const vx = inner(lines.vx, S.orig.w), hy = inner(lines.hy, S.orig.h);
+    const cols = vx.length + 1, rows = hy.length + 1;
+    if ((vx.length >= 1 || hy.length >= 1) && cols >= 2 && rows >= 2 && cols * rows <= 64) {
+      S.grid.mode = 'grid'; S.grid.cols = cols; S.grid.rows = rows;
+      S.grid.vx = vx.length ? lines.vx : null; S.grid.hy = hy.length ? lines.hy : null;
+      $('#gridMode').value = 'grid';
+      toast(`Sheet rules found — ${cols}×${rows} panels (${cols * rows} frames)`);
+      sliceGrid();
+      return;
+    }
   }
   const keep = contentMask(S.orig.cv, S.tol);
   // apply alpha to a copy used for island cropping/hashes
@@ -1235,7 +1416,12 @@ function bindUI() {
   };
   gridInputs.forEach((sel) => {
     const el2 = $(sel);
-    el2.onchange = () => { if (!S.orig || S.grid.mode === 'auto') return; readGrid(); sliceGrid(); };
+    el2.onchange = () => {
+      if (!S.orig || S.grid.mode === 'auto') return;
+      readGrid();
+      S.grid.vx = null; S.grid.hy = null;   // editing the numbers overrides detected rules
+      sliceGrid();
+    };
   });
   $('#btnDemo').onclick = () => loadDemo();
   $('#btnDemo2').onclick = () => loadDemo();
