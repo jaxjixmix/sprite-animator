@@ -30,8 +30,13 @@ const S = {
   islands: [],               // [{x,y,w,h,pix,area,dup}]
   sel: 0,                    // single mode: chosen island index
   mode: 'single',            // 'single' (synthetic motion) | 'frames' (real poses)
-  frameSel: null,            // frames mode: array of chosen island indexes
-  frameCrops: [],            // frames mode: [{cv,w,h}] per chosen island
+  frameSource: 'islands',    // 'islands' (auto/manual selection) | 'grid' (manual slice)
+  frameSel: null,            // islands source: chosen island indexes
+  frameCrops: [],            // frames mode: [{cv,w,h}] in playback order
+  durations: [],             // ms per frame (per-frame timing)
+  useDurations: true,
+  grid: { mode: 'auto', cols: 6, rows: 1, cw: 200, ch: 300, ox: 0, oy: 0, keepLargest: true },
+  tMs: 0,                    // playback position within the loop (ms)
   spr: null,                 // {cv, w, h} chosen, trimmed sprite
   layout: null,              // {W,H,ax,ay,pad}
   hasAlpha: false,
@@ -45,7 +50,31 @@ const S = {
   zoom: 100, pixel: false,
   busy: false,
 };
-const effN = () => (S.mode === 'frames' ? S.frameSel.length : S.N);
+const effN = () => (S.mode === 'frames' ? S.frameCrops.length : S.N);
+/* ---- frame timing ---- */
+function totalMs() {
+  if (!S.useDurations || !S.durations.length) return Math.max(1, effN() * 1000 / S.fps);
+  return S.durations.reduce((a, b) => a + b, 0);
+}
+function frameAtMs(ms) {
+  const n = effN();
+  if (!n) return 0;
+  if (!S.useDurations || S.durations.length !== n) return Math.min(n - 1, Math.floor(ms / (1000 / S.fps)) % n);
+  let acc = 0;
+  for (let i = 0; i < n; i++) { acc += S.durations[i]; if (ms < acc) return i; }
+  return n - 1;
+}
+function frameStartMs(i) {
+  if (!S.useDurations || S.durations.length !== effN()) return i * (1000 / S.fps);
+  let acc = 0;
+  for (let k = 0; k < i; k++) acc += S.durations[k];
+  return acc;
+}
+function resetDurations(uniformMs) {
+  const n = effN();
+  S.durations = Array.from({ length: n }, () => (uniformMs !== undefined ? uniformMs : Math.round(1000 / S.fps)));
+  S.tMs = 0;
+}
 
 /* ============================================================
    Motion presets.
@@ -388,10 +417,82 @@ function islandCrop(idx) {
   return { cv, w, h };
 }
 function buildFrames() {
-  S.frameCrops = S.frameSel.map(islandCrop);
+  if (S.frameSource === 'islands') S.frameCrops = S.frameSel.map(islandCrop);
   let mw = 0, mh = 0;
   for (const f of S.frameCrops) { if (f.w > mw) mw = f.w; if (f.h > mh) mh = f.h; }
   S.frameBox = { w: mw, h: mh };
+  if (S.durations.length !== S.frameCrops.length) resetDurations();
+}
+
+/* ---- manual slicing: equal grid cells or fixed cell size ---- */
+function bboxOfMask(keep, w, h) {
+  let minX = w, minY = h, maxX = -1, maxY = -1;
+  for (let i = 0; i < keep.length; i++) {
+    if (!keep[i]) continue;
+    const x = i % w, y = (i / w) | 0;
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+  }
+  return maxX < 0 ? null : { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+}
+/* one grid cell -> frame crop (largest figure, or everything) */
+function cellCrop(cell) {
+  const cw = cell.w, chh = cell.h;
+  const tmp = document.createElement('canvas');
+  tmp.width = cw; tmp.height = chh;
+  const tctx = tmp.getContext('2d');
+  tctx.drawImage(S.orig.cv, cell.x, cell.y, cw, chh, 0, 0, cw, chh);
+  const keep = contentMask(tmp, S.tol);
+  const id = tctx.getImageData(0, 0, cw, chh);
+  keep.fillAlpha(id.data);
+  tctx.putImageData(id, 0, 0);
+  let box = null;
+  if (S.grid.keepLargest) {
+    const isl = findIslands(tmp, keep.keep);
+    if (isl.length) box = { x: isl[0].x, y: isl[0].y, w: isl[0].w, h: isl[0].h };
+  }
+  if (!box) box = bboxOfMask(keep.keep, cw, chh);
+  if (!box) return { cv: tmp, w: cw, h: chh };
+  const pad = 4;
+  const x = Math.max(0, box.x - pad), y = Math.max(0, box.y - pad);
+  const w = Math.min(cw - x, box.w + pad * 2), h = Math.min(chh - y, box.h + pad * 2);
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  cv.getContext('2d').drawImage(tmp, x, y, w, h, 0, 0, w, h);
+  return { cv, w, h };
+}
+function sliceGrid() {
+  if (!S.orig) return;
+  const g = S.grid;
+  let cols, rows, cw, ch;
+  if (g.mode === 'cell') {
+    cw = Math.max(8, Math.round(g.cw)); ch = Math.max(8, Math.round(g.ch));
+    cols = Math.max(1, Math.floor((S.orig.w - g.ox) / cw));
+    rows = Math.max(1, Math.floor((S.orig.h - g.oy) / ch));
+  } else {
+    cols = Math.max(1, Math.min(24, Math.round(g.cols)));
+    rows = Math.max(1, Math.min(24, Math.round(g.rows)));
+    cw = Math.floor((S.orig.w - g.ox) / cols);
+    ch = Math.floor((S.orig.h - g.oy) / rows);
+  }
+  const cells = [];
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const x = g.ox + c * cw, y = g.oy + r * ch;
+    const w = Math.min(cw, S.orig.w - x), h = Math.min(ch, S.orig.h - y);
+    if (w >= 8 && h >= 8) cells.push({ x, y, w, h });
+  }
+  if (!cells.length) { toast('⚠ Grid produced no cells — check size/offsets'); return; }
+  S.frameSource = 'grid';
+  S.mode = 'frames';
+  S.frameSel = null;
+  S.frameCrops = cells.map(cellCrop);
+  let mw = 0, mh = 0;
+  for (const f of S.frameCrops) { if (f.w > mw) mw = f.w; if (f.h > mh) mh = f.h; }
+  S.frameBox = { w: mw, h: mh };
+  if (S.durations.length !== S.frameCrops.length) resetDurations();
+  S.preset = 'none'; setPreset('none');
+  computeLayout(); renderIslands(); buildDurations(); syncExportUI(); applyStage();
+  toast(`Sliced ${cells.length} frames (${cols}×${rows})`);
 }
 
 /* ============================================================
@@ -455,12 +556,15 @@ function computeLayout() {
 /* ============================================================
    Rendering
    ============================================================ */
-function drawAt(ctx, u, ox = 0, oy = 0) {
+function drawAt(ctx, u, ox = 0, oy = 0, frameIdx = null) {
   const { layout } = S;
   if (S.mode === 'frames') {
     const n = effN();
     if (!n) return;
-    const f = S.frameCrops[Math.min(n - 1, Math.floor(u * n)) % n];
+    const k = frameIdx === null
+      ? Math.min(n - 1, Math.floor(u * n)) % n
+      : Math.max(0, Math.min(n - 1, Math.round(frameIdx)));
+    const f = S.frameCrops[k];
     // bottom-align frames so feet stay on the same baseline
     ctx.drawImage(f.cv, layout.ax + ox - f.w / 2, layout.pad + S.frameBox.h - f.h);
     return;
@@ -493,26 +597,34 @@ const pvCtx = pvCanvas.getContext('2d');
 let rafT0 = 0;
 function frameTick(now) {
   requestAnimationFrame(frameTick);
-  const P = effN() / S.fps; // seconds per loop (also drives preview pacing)
+  const dt = (now - (rafT0 || now)) / 1000;
+  rafT0 = now;
   if (S.playing) {
-    const dt = (now - (rafT0 || now)) / 1000;
-    rafT0 = now;
-    S.u = (S.u + dt * S.tempo / P) % 1;
-  } else rafT0 = now;
+    if (S.mode === 'frames') {
+      const T = Math.max(1, totalMs());
+      S.tMs = (S.tMs + dt * 1000 * S.tempo) % T;
+      S.u = frameAtMs(S.tMs) / Math.max(1, effN());
+    } else {
+      S.u = (S.u + dt * S.tempo * S.fps / Math.max(1, effN())) % 1;
+    }
+  }
   renderPreview();
 }
 function renderPreview() {
   const { layout } = S;
   if (!layout) return;
   const N = effN();
-  const u = S.smoothMode ? S.u : (Math.floor(S.u * N + 1e-6) % N) / N;
+  const idx = S.mode === 'frames'
+    ? frameAtMs(S.tMs)
+    : (S.smoothMode ? Math.floor(S.u * N + 1e-6) % N : Math.floor(S.u * N + 1e-6) % N);
+  const u = S.smoothMode && S.mode !== 'frames' ? S.u : (idx + 0.5) / N;
   if (pvCanvas.width !== layout.W) { pvCanvas.width = layout.W; pvCanvas.height = layout.H; }
   pvCtx.clearRect(0, 0, layout.W, layout.H);
-  drawAt(pvCtx, u);
-  const k = Math.floor(S.u * N + 1e-6) % N;
+  drawAt(pvCtx, u, 0, 0, S.mode === 'frames' ? idx : null);
+  const dur = (S.useDurations && S.durations[idx]) ? S.durations[idx] : 1000 / S.fps;
   $('#pvInfo').textContent =
-    `${S.preset} · frame ${k + 1}/${N} @ ${S.fps} fps → ${(1000 / S.fps).toFixed(0)} ms/frame` +
-    (S.mode === 'frames' ? ' (real poses)' : S.smoothMode ? '' : ' (frames)');
+    `${S.preset} · frame ${idx + 1}/${N} · ${dur} ms` +
+    (S.mode === 'frames' ? ` (real poses${S.frameSource === 'grid' ? ', grid' : ''})` : ` (${S.fps} fps)`);
 }
 function applyStage() {
   const stage = $('#stage');
@@ -553,12 +665,14 @@ async function exportGIF() {
   const solid = S.backdrop === 'white' ? 'white' : S.backdrop === 'black' ? 'black' : null;
   const transparent = S.hasAlpha && !solid;
   const gif = G.GIFEncoder();
-  let delay = Math.max(20, Math.round(1000 / S.fps));
-  const uVals = [...Array(effN())].map((_, k) => k / effN());
-  let first = true;
-  for (const u of uVals) {
+  const n = effN();
+  const delayFor = (k) => {
+    const d = (S.useDurations && S.durations.length === n) ? S.durations[k] : 1000 / S.fps;
+    return Math.max(20, Math.round(d));
+  };
+  for (let k = 0; k < n; k++) {
     const f = makeFrameCanvas(solid);
-    drawAt(f.ctx, u);
+    drawAt(f.ctx, k / n, 0, 0, S.mode === 'frames' ? k : null);
     const id = f.ctx.getImageData(0, 0, W, H).data;
     let palette, index;
     if (transparent) {
@@ -577,9 +691,8 @@ async function exportGIF() {
       }
       for (let i = 0; i < index.length; i++) if (id[i * 4 + 3] < 128) index[i] = tIdx;
     }
-    gif.writeFrame(index, W, H, { palette, delay, transparent: !!tIdx, transparentIndex: tIdx, dispose: 2 });
+    gif.writeFrame(index, W, H, { palette, delay: delayFor(k), transparent: !!tIdx, transparentIndex: tIdx, dispose: 2 });
     await new Promise((r) => setTimeout(r, 0)); // let UI breathe
-    first = false;
   }
   gif.finish();
   return new Blob([gif.bytes()], { type: 'image/gif' });
@@ -601,16 +714,16 @@ async function exportVideo() {
   rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
   const done = new Promise((res) => { rec.onstop = res; });
   rec.start();
-  const P = effN() / S.fps;
+  const T = Math.max(1, totalMs()); // loop length, ms (per-frame durations honoured)
   const t0 = performance.now();
   await new Promise((res) => {
     (function render() {
-      const t = (performance.now() - t0) / 1000;
+      const el = (performance.now() - t0) * S.tempo; // ms of animation elapsed
       const ctx = cv.getContext('2d');
       ctx.clearRect(0, 0, W, H);
-      const u = (t * S.tempo / P) % 1;
-      drawAt(ctx, u);
-      if (t < P * 2.05) requestAnimationFrame(render); else { rec.stop(); res(); }
+      const k = frameAtMs(el % T);
+      drawAt(ctx, (el % T) / T, 0, 0, S.mode === 'frames' ? k : null);
+      if (el < T * 2.05) requestAnimationFrame(render); else { rec.stop(); res(); }
     })();
   });
   await done;
@@ -628,17 +741,19 @@ function exportSheet() {
   cv.width = W * cols; cv.height = H * rows;
   const ctx = cv.getContext('2d');
   for (let k = 0; k < N; k++) {
-    const u = k / N;
     ctx.save();
     ctx.translate((k % cols) * W, Math.floor(k / cols) * H);
-    drawAt(ctx, u);
+    drawAt(ctx, k / N, 0, 0, S.mode === 'frames' ? k : null);
     ctx.restore();
   }
   const meta = {
     app: 'sprite-animator', preset: S.preset, params: S.params[S.preset],
-    mode: S.mode,
+    mode: S.mode, frameSource: S.frameSource,
     frameWidth: W, frameHeight: H, frames: N, fps: S.fps,
-    cols, rows, loopSeconds: +(N / S.fps).toFixed(3),
+    timing: (S.useDurations && S.durations.length === N) ? 'per-frame' : 'uniform',
+    durations: (S.useDurations && S.durations.length === N) ? S.durations.slice() : null,
+    loopMs: Math.round(totalMs()),
+    cols, rows, loopSeconds: +(totalMs() / 1000).toFixed(3),
   };
   return {
     sheet: new Promise((res) => cv.toBlob((b) => res(b), 'image/png')),
@@ -668,7 +783,8 @@ async function loadBlob(blob, name) {
     updateTolVisibility();
     S._autoTol = true;
     processCurrent();
-    S.u = 0; S.playing = true; rafT0 = 0;
+    if (S.grid.mode !== 'auto') sliceGrid();   // honour an active manual grid on new images
+    S.u = 0; S.tMs = 0; S.playing = true; rafT0 = 0;
     $('#scrub').value = 0;
     toast(`Loaded ${cv.width}×${cv.height}${name ? ' · ' + name : ''}`);
   } catch (e) {
@@ -699,7 +815,7 @@ function processCurrent() {
   // frames mode: auto-detect a strip of real poses (needs >=2 distinct)
   const strip = findFrameStrip(islands);
   if (strip && strip.length >= 2) {
-    S.mode = 'frames'; S.frameSel = strip; buildFrames();
+    S.mode = 'frames'; S.frameSource = 'islands'; S.frameSel = strip; buildFrames();
     S.preset = 'none'; setPreset('none');
   } else {
     S.mode = 'single'; S.frameSel = null; S.frameCrops = [];
@@ -707,6 +823,7 @@ function processCurrent() {
   buildSprite();
   computeLayout();
   renderIslands(uniq);
+  buildDurations();
   syncExportUI();
   applyStage();
 }
@@ -714,6 +831,22 @@ function renderIslands(_u) {
   const uniq = _u !== undefined ? _u : S.islands.filter((x) => x.dup < 0).length;
   const row = $('#islandsRow');
   row.innerHTML = '';
+  if (S.mode === 'frames' && S.frameSource === 'grid') {
+    // manual grid: islands aren't the frames, show the sliced cells as chips
+    $('#islandsWrap').style.display = 'block';
+    $('#dupNote').classList.remove('show');
+    S.frameCrops.forEach((f, i) => {
+      const b = document.createElement('button');
+      b.className = 'isl sel';
+      b.title = `Cell ${i + 1}: ${f.w}×${f.h}`;
+      const img = document.createElement('img');
+      img.src = f.cv.toDataURL();
+      const lab = document.createElement('small');
+      lab.textContent = `#${i + 1} · ${f.w}×${f.h}`;
+      b.append(img, lab);
+      row.appendChild(b);
+    });
+  } else {
   const showRow = S.islands.length > 1 && (S.mode === 'frames' || S.islands.length > 2);
   $('#islandsWrap').style.display = showRow ? 'block' : 'none';
   const manyCopies = S.islands.length >= 4 && uniq <= 3 && uniq < S.islands.length;
@@ -725,7 +858,7 @@ function renderIslands(_u) {
       `use the chips to rotate through figures.`;
   }
   S.islands.forEach((isl, i) => {
-    const on = S.mode === 'frames' ? S.frameSel.includes(i) : i === S.sel;
+    const on = S.mode === 'frames' ? !!(S.frameSel && S.frameSel.includes(i)) : i === S.sel;
     const b = document.createElement('button');
     b.className = 'isl' + (on ? ' sel' : '');
     b.title = `Island ${i + 1}: ${isl.w}×${isl.h}`;
@@ -743,15 +876,19 @@ function renderIslands(_u) {
           S.frameSel.splice(idx, 1);
         } else S.frameSel.push(i);
         S.frameSel.sort((a, c) => S.islands[a].x - S.islands[c].x);
-        buildFrames(); computeLayout(); renderIslands(uniq); syncExportUI(); applyStage();
+        S.frameSource = 'islands';
+        buildFrames(); computeLayout(); renderIslands(uniq); buildDurations(); syncExportUI(); applyStage();
       } else {
         S.sel = i; buildSprite(); computeLayout(); renderIslands(uniq); syncExportUI(); applyStage();
       }
     };
     row.appendChild(b);
   });
+  }  // end island-chips branch
   const modeTxt = S.mode === 'frames'
-    ? `Frame mode: playing ${S.frameSel.length} detected poses in order (click chips to exclude/include — manual set).`
+    ? (S.frameSource === 'grid'
+        ? `Frame mode (manual grid): ${S.frameCrops.length} cells sliced from the image — edit Columns/Rows or Cell size to re-slice, and set durations below.`
+        : `Frame mode: playing ${S.frameCrops.length} detected poses in order (click chips to exclude/include — manual set).`)
     : `Single sprite mode — synthetic motion. Click a chip to switch which sprite to animate.`;
   $('#islandsRow').insertAdjacentHTML('beforeend',
     `<div style="width:100%;font-size:12px;color:var(--mut);padding-top:2px">${modeTxt}</div>`);
@@ -761,7 +898,7 @@ function renderIslands(_u) {
   $('#srcInfo').textContent =
     `Source ${S.orig.w}×${S.orig.h}${S.nativeAlpha ? ' · transparent PNG' : ''}` +
     (S.mode === 'frames'
-      ? ` → ${S.frameSel.length} frames detected (largest figures, ${S.frameBox.w}×${S.frameBox.h})`
+      ? ` → ${S.frameCrops.length} frames (${S.frameSource === 'grid' ? 'manual grid' : 'detected figures'}, ${S.frameBox.w}×${S.frameBox.h})`
       : ` → sprite ${S.spr.w}×${S.spr.h}, ${S.islands.length} island${S.islands.length > 1 ? 's' : ''} detected`);
   $('#sizeInfo').textContent = `frame canvas ${S.layout.W}×${S.layout.H}px`;
 }
@@ -814,6 +951,39 @@ function buildParams() {
     box.appendChild(wrap);
   }
 }
+/* per-frame duration editor */
+function buildDurations() {
+  const row = $('#durRow');
+  if (!row) return;
+  row.innerHTML = '';
+  const n = effN();
+  if (S.mode !== 'frames') {
+    row.innerHTML = '<small class="mut">Per-frame durations apply when frames come from a sheet (frame mode). Here the motion is continuous at the FPS above.</small>';
+    return;
+  }
+  if (!S.durations.length || S.durations.length !== n) resetDurations();
+  const disabled = !S.useDurations;
+  $('#durRow').style.opacity = disabled ? '0.4' : '1';
+  for (let i = 0; i < n; i++) {
+    const wrap = document.createElement('label');
+    wrap.style.cssText = 'display:flex;flex-direction:column;align-items:center;font-size:10.5px;color:var(--mut)';
+    wrap.textContent = i + 1;
+    const inp = document.createElement('input');
+    inp.type = 'number'; inp.min = 20; inp.max = 10000; inp.step = 50;
+    inp.value = S.durations[i];
+    inp.disabled = disabled;
+    inp.title = `Frame ${i + 1} duration (ms)`;
+    inp.style.cssText = 'width:62px;background:var(--panel2);color:var(--tx);border:1px solid var(--line);border-radius:7px;padding:4px 5px;font-size:12px';
+    inp.oninput = () => {
+      const v = Math.max(20, Math.min(10000, +inp.value || 100));
+      S.durations[i] = v;
+      S.tMs = Math.min(S.tMs, Math.max(0, totalMs() - 1));
+      syncExportUI(); renderPreview();
+    };
+    wrap.appendChild(inp);
+    row.appendChild(wrap);
+  }
+}
 function syncExportUI() {
   const N = effN();
   $('#valFps').textContent = S.fps;
@@ -824,9 +994,13 @@ function syncExportUI() {
   $('#valCols').textContent = Math.min(S.cols, N);
   $('#scrub').max = N - 1;
   $('#frameSizeInfo').textContent = S.layout ? `${S.layout.W}×${S.layout.H}px` : '—';
-  const P = N / S.fps;
+  const T = totalMs();
+  $('#loopInfo').textContent = S.mode !== 'frames'
+    ? `uniform ${Math.round(1000 / S.fps)} ms/frame · loop ${(T / 1000).toFixed(2)} s`
+    : `loop ${(T / 1000).toFixed(2)} s` +
+      (S.useDurations && S.durations.length === N ? ` (per-frame: ${S.durations.join('/')} ms)` : ` (uniform ${Math.round(1000 / S.fps)} ms)`);
   $('#expNote').textContent = S.layout
-    ? `${N} frames × ${(1000 / S.fps).toFixed(0)} ms = ${P.toFixed(2)} s per loop · sheet ${Math.min(S.cols, N)}×${Math.ceil(N / Math.min(S.cols, N))}` +
+    ? `${N} frames × ${(T / N).toFixed(0)} ms avg = ${(T / 1000).toFixed(2)} s per loop · sheet ${Math.min(S.cols, N)}×${Math.ceil(N / Math.min(S.cols, N))}` +
       (S.hasAlpha ? ' · GIF keeps transparency' : '')
     : '';
 }
@@ -860,9 +1034,37 @@ function bindUI() {
     buildFrames(); computeLayout(); renderIslands(); syncExportUI(); applyStage();
   };
   $('#btnFramesOff').onclick = () => {
-    S.mode = 'single'; S.frameSel = null; S.frameCrops = [];
-    buildSprite(); computeLayout(); renderIslands(); syncExportUI(); applyStage();
+    S.mode = 'single'; S.frameSource = 'islands'; S.frameSel = null; S.frameCrops = [];
+    buildSprite(); computeLayout(); renderIslands(); buildDurations(); syncExportUI(); applyStage();
   };
+  /* timing + manual grid controls */
+  $('#chkPerFrame').onchange = () => { S.useDurations = $('#chkPerFrame').checked; buildDurations(); syncExportUI(); };
+  $('#btnUniform').onclick = () => { resetDurations(Math.round(1000 / S.fps)); buildDurations(); syncExportUI(); renderPreview(); };
+  const gridInputs = ['#gCols', '#gRows', '#gCw', '#gCh', '#gOx', '#gOy', '#gKeep'];
+  function readGrid() {
+    S.grid.cols = Math.max(1, Math.min(24, +$('#gCols').value || 1));
+    S.grid.rows = Math.max(1, Math.min(24, +$('#gRows').value || 1));
+    S.grid.cw = Math.max(8, +$('#gCw').value || 8);
+    S.grid.ch = Math.max(8, +$('#gCh').value || 8);
+    S.grid.ox = +$('#gOx').value || 0;
+    S.grid.oy = +$('#gOy').value || 0;
+    S.grid.keepLargest = $('#gKeep').checked;
+  }
+  $('#gridMode').onchange = () => {
+    const m = $('#gridMode').value;
+    S.grid.mode = m;
+    const manual = m !== 'auto';
+    $('#gridOpts').style.display = manual ? 'block' : 'none';
+    $('#gridRows').style.display = m === 'grid' ? 'flex' : 'none';
+    $('#gridCells').style.display = m === 'cell' ? 'flex' : 'none';
+    if (!S.orig) return;
+    readGrid();
+    if (manual) sliceGrid(); else processCurrent();
+  };
+  gridInputs.forEach((sel) => {
+    const el2 = $(sel);
+    el2.onchange = () => { if (!S.orig || S.grid.mode === 'auto') return; readGrid(); sliceGrid(); };
+  });
   $('#btnDemo').onclick = async () => {
     const b64 = DEMO_B64;
     const bin = atob(b64), u8 = new Uint8Array(bin.length);
@@ -884,8 +1086,21 @@ function bindUI() {
   $('#btnPlay').onclick = () => { S.playing = !S.playing; $('#btnPlay').textContent = S.playing ? '⏸' : '▶'; rafT0 = 0; };
   $('#btnPrev').onclick = () => step(-1);
   $('#btnNext').onclick = () => step(1);
-  $('#scrub').oninput = () => { S.u = +$('#scrub').value / effN(); if (!S.playing) renderPreview(); };
-  function step(d) { const N = effN(); S.u = (S.u + d / N + 1) % 1; $('#scrub').value = Math.floor(S.u * N) % N; renderPreview(); }
+  $('#scrub').oninput = () => {
+    const k = clamp(+$('#scrub').value | 0, 0, Math.max(0, effN() - 1));
+    S.tMs = frameStartMs(k);
+    if (S.mode === 'frames') S.u = k / Math.max(1, effN());
+    renderPreview();
+  };
+  function step(d) {
+    const N = effN();
+    const k = S.mode === 'frames'
+      ? clamp(frameAtMs(S.tMs) + d, 0, N - 1)
+      : (Math.floor(S.u * N) + d + N) % N;
+    if (S.mode === 'frames') { S.tMs = frameStartMs(k); S.u = k / N; }
+    else S.u = (S.u + d / N + 1) % 1;
+    $('#scrub').value = k; renderPreview();
+  }
   $$('#modeSeg button').forEach((b) => {
     b.onclick = () => {
       S.smoothMode = b.dataset.m === 'smooth';
@@ -942,7 +1157,9 @@ init();
 window.__SA = {
   load: (blob, name) => loadBlob(blob, name),
   setPreset, state: () => ({ preset: S.preset, params: S.params[S.preset], fps: S.fps, N: S.N,
-    mode: S.mode, frameSel: S.frameSel ? S.frameSel.length : 0, tol: S.tol,
+    mode: S.mode, frameSource: S.frameSource, frameSel: S.frameSel ? S.frameSel.length : 0,
+    frames: S.frameCrops.length, durations: S.durations.slice(), loopMs: Math.round(totalMs()),
+    gridMode: S.grid.mode, grid: { ...S.grid }, tol: S.tol,
     islands: S.islands.length, uniq: S.islands.filter(i => i.dup < 0).length, sel: S.sel,
     spr: S.spr ? { w: S.spr.w, h: S.spr.h } : null,
     layout: S.layout ? { W: S.layout.W, H: S.layout.H } : null,

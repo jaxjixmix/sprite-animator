@@ -126,6 +126,29 @@ small{color:var(--mut)}
       <div class="ctl mt10"><span>Trim empty margins</span><span style="flex:1"></span>
         <label class="chk"><input type="checkbox" id="chkTrim" checked> auto-trim</label>
       </div>
+      <div class="hr"></div>
+      <div class="ctl"><b>Frame detection</b><span style="flex:1"></span>
+        <select id="gridMode" style="background:var(--panel2);color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:5px 8px">
+          <option value="auto" selected>Auto-detect figures</option>
+          <option value="grid">Manual grid (columns × rows)</option>
+          <option value="cell">Manual cell size (px)</option>
+        </select>
+      </div>
+      <div id="gridOpts" style="display:none">
+        <div class="toolrow" id="gridRows">
+          <div class="ctl"><span>Columns</span><input type="number" id="gCols" min="1" max="24" step="1" value="6" style="width:64px;background:var(--panel2);color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:5px 7px"></div>
+          <div class="ctl"><span>Rows</span><input type="number" id="gRows" min="1" max="24" step="1" value="1" style="width:64px;background:var(--panel2);color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:5px 7px"></div>
+        </div>
+        <div class="toolrow" id="gridCells">
+          <div class="ctl"><span>Cell W px</span><input type="number" id="gCw" min="8" step="1" value="200" style="width:70px;background:var(--panel2);color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:5px 7px"></div>
+          <div class="ctl"><span>Cell H px</span><input type="number" id="gCh" min="8" step="1" value="300" style="width:70px;background:var(--panel2);color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:5px 7px"></div>
+        </div>
+        <div class="toolrow">
+          <div class="ctl"><span>Offset X</span><input type="number" id="gOx" step="1" value="0" style="width:64px;background:var(--panel2);color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:5px 7px"></div>
+          <div class="ctl"><span>Offset Y</span><input type="number" id="gOy" step="1" value="0" style="width:64px;background:var(--panel2);color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:5px 7px"></div>
+        </div>
+        <label class="chk mt10"><input type="checkbox" id="gKeep" checked> Keep largest figure per cell (drops captions/labels)</label>
+      </div>
     </section>
 
     <section class="card">
@@ -137,7 +160,16 @@ small{color:var(--mut)}
     </section>
 
     <section class="card">
-      <h2>3 · Export <span class="hint">— frames are sampled from the motion above</span></h2>
+      <h2>3 · Timing &amp; Export <span class="hint">— per-frame durations are honoured by GIF / video / JSON</span></h2>
+      <div class="ctl"><b>Frame timing</b><span style="flex:1"></span>
+        <label class="chk"><input type="checkbox" id="chkPerFrame" checked> per-frame durations</label>
+      </div>
+      <div class="row" id="durRow" style="gap:6px"></div>
+      <div class="row">
+        <button id="btnUniform">Reset to uniform</button>
+        <small class="mut" id="loopInfo"></small>
+      </div>
+      <div class="hr"></div>
       <div class="toolrow">
         <div class="ctl"><span>FPS</span><input type="range" id="rangeFps" min="4" max="30" step="1" value="12"><output id="valFps">12</output></div>
         <div class="ctl"><span>Frames/loop</span><input type="range" id="rangeN" min="4" max="48" step="1" value="16"><output id="valN">16</output></div>
