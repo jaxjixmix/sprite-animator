@@ -37,6 +37,10 @@ const S = {
   useDurations: true,
   grid: { mode: 'auto', cols: 6, rows: 1, cw: 200, ch: 300, ox: 0, oy: 0, keepLargest: true },
   tMs: 0,                    // playback position within the loop (ms)
+  selFrame: 0,               // frame highlighted on the timeline
+  thumbs: [],                // timeline block thumbnails (data URLs)
+  loaded: false,
+  zoomFit: true,             // preview fills the stage until the user drags the zoom slider
   spr: null,                 // {cv, w, h} chosen, trimmed sprite
   layout: null,              // {W,H,ax,ay,pad}
   hasAlpha: false,
@@ -491,7 +495,7 @@ function sliceGrid() {
   S.frameBox = { w: mw, h: mh };
   if (S.durations.length !== S.frameCrops.length) resetDurations();
   S.preset = 'none'; setPreset('none');
-  computeLayout(); renderIslands(); buildDurations(); syncExportUI(); applyStage();
+  computeLayout(); renderIslands(); refreshAll({ thumbs: true });
   toast(`Sliced ${cells.length} frames (${cols}×${rows})`);
 }
 
@@ -614,32 +618,35 @@ function renderPreview() {
   const { layout } = S;
   if (!layout) return;
   const N = effN();
-  const idx = S.mode === 'frames'
-    ? frameAtMs(S.tMs)
-    : (S.smoothMode ? Math.floor(S.u * N + 1e-6) % N : Math.floor(S.u * N + 1e-6) % N);
-  const u = S.smoothMode && S.mode !== 'frames' ? S.u : (idx + 0.5) / N;
+  const idx = S.mode === 'frames' ? frameAtMs(S.tMs) : Math.floor(S.u * N + 1e-6) % Math.max(1, N);
+  const u = (S.mode === 'frames' || !S.smoothMode) ? (idx + 0.5) / N : S.u;
   if (pvCanvas.width !== layout.W) { pvCanvas.width = layout.W; pvCanvas.height = layout.H; }
   pvCtx.clearRect(0, 0, layout.W, layout.H);
   drawAt(pvCtx, u, 0, 0, S.mode === 'frames' ? idx : null);
-  const dur = (S.useDurations && S.durations[idx]) ? S.durations[idx] : 1000 / S.fps;
-  $('#pvInfo').textContent =
-    `${S.preset} · frame ${idx + 1}/${N} · ${dur} ms` +
-    (S.mode === 'frames' ? ` (real poses${S.frameSource === 'grid' ? ', grid' : ''})` : ` (${S.fps} fps)`);
+  const dur = (S.useDurations && S.durations[idx]) ? S.durations[idx] : Math.round(1000 / S.fps);
+  const src = S.mode === 'frames' ? (S.frameSource === 'grid' ? 'manual grid' : 'detected poses') : `synthetic · ${S.fps} fps`;
+  $('#pvInfo').textContent = `Frame ${idx + 1}/${N} · ${dur} ms · ${src}`;
+  pvCanvas.setAttribute('aria-label', `Animation preview, frame ${idx + 1} of ${N}, ${dur} milliseconds`);
+  highlightTimeline(idx);
 }
 function applyStage() {
   const stage = $('#stage');
   stage.classList.remove('checker', 'white', 'black');
   stage.classList.add(S.backdrop);
   $('#pv').classList.toggle('pix', S.pixel);
-  const { W } = S.layout || { W: 0 };
-  const cw = stage.clientWidth - 20;
-  const z = S.zoom / 100;
-  let cssW = W ? Math.min(W * z, cw) : 0;
-  if (!W) return;
-  $('#pv').style.width = cssW + 'px';
-  $('#pv').style.height = Math.round(cssW * (S.layout.H / W)) + 'px';
+  const L = S.layout;
+  if (!L) { $('#pv').style.width = ''; $('#pv').style.height = ''; return; }
+  const availW = Math.max(60, stage.clientWidth - 18);
+  const availH = Math.max(60, stage.clientHeight - 18);
+  const fit = Math.min(availW / L.W, availH / L.H, 4);
+  const scale = S.zoomFit ? fit : Math.min(S.zoom / 100, availW / L.W);
+  $('#pv').style.width = Math.round(L.W * scale) + 'px';
+  $('#pv').style.height = Math.round(L.H * scale) + 'px';
+  // hug the sprite's aspect so wide screens don't show a sea of empty checkerboard
+  stage.style.maxWidth = S.loaded ? Math.max(240, Math.round(stage.clientHeight * (L.W / L.H))) + 'px' : '';
+  $('#valZoom').textContent = S.zoomFit ? Math.round(scale * 100) + '% fit' : Math.round(scale * 100) + '%';
 }
-new ResizeObserver(applyStage).observe($('#stage'));
+new ResizeObserver(() => { applyStage(); renderTimeline(); }).observe($('#stage'));
 
 /* ============================================================
    Exports
@@ -784,8 +791,10 @@ async function loadBlob(blob, name) {
     S._autoTol = true;
     processCurrent();
     if (S.grid.mode !== 'auto') sliceGrid();   // honour an active manual grid on new images
-    S.u = 0; S.tMs = 0; S.playing = true; rafT0 = 0;
-    $('#scrub').value = 0;
+    S.u = 0; S.tMs = 0; S.selFrame = 0; S.playing = true; rafT0 = 0;
+    $('#btnPlay').textContent = '⏸';
+    setLoaded(true);
+    refreshAll({ thumbs: true });
     toast(`Loaded ${cv.width}×${cv.height}${name ? ' · ' + name : ''}`);
   } catch (e) {
     toast('⚠ ' + e.message);
@@ -823,9 +832,9 @@ function processCurrent() {
   buildSprite();
   computeLayout();
   renderIslands(uniq);
-  buildDurations();
-  syncExportUI();
-  applyStage();
+  setLoaded(true);
+  S.selFrame = 0;
+  refreshAll({ thumbs: true });
 }
 function renderIslands(_u) {
   const uniq = _u !== undefined ? _u : S.islands.filter((x) => x.dup < 0).length;
@@ -877,7 +886,7 @@ function renderIslands(_u) {
         } else S.frameSel.push(i);
         S.frameSel.sort((a, c) => S.islands[a].x - S.islands[c].x);
         S.frameSource = 'islands';
-        buildFrames(); computeLayout(); renderIslands(uniq); buildDurations(); syncExportUI(); applyStage();
+        buildFrames(); computeLayout(); renderIslands(uniq); refreshAll({ thumbs: true });
       } else {
         S.sel = i; buildSprite(); computeLayout(); renderIslands(uniq); syncExportUI(); applyStage();
       }
@@ -900,7 +909,6 @@ function renderIslands(_u) {
     (S.mode === 'frames'
       ? ` → ${S.frameCrops.length} frames (${S.frameSource === 'grid' ? 'manual grid' : 'detected figures'}, ${S.frameBox.w}×${S.frameBox.h})`
       : ` → sprite ${S.spr.w}×${S.spr.h}, ${S.islands.length} island${S.islands.length > 1 ? 's' : ''} detected`);
-  $('#sizeInfo').textContent = `frame canvas ${S.layout.W}×${S.layout.H}px`;
 }
 function cropDataURL(isl) {
   const c = document.createElement('canvas');
@@ -941,6 +949,7 @@ function buildParams() {
     const lab = el('span', '', d.label);
     const inp = document.createElement('input');
     inp.type = 'range'; inp.min = d.min; inp.max = d.max; inp.step = d.step || 1; inp.value = v;
+ inp.setAttribute('aria-label', `${d.label}${d.unit ? ' in ' + (d.unit.includes('°') ? 'degrees' : 'percent') : ''}`);
     const out = el('output', '', v + (d.unit || ''));
     inp.oninput = () => {
       S.params[preset][key] = +inp.value;
@@ -951,58 +960,160 @@ function buildParams() {
     box.appendChild(wrap);
   }
 }
-/* per-frame duration editor */
-function buildDurations() {
-  const row = $('#durRow');
-  if (!row) return;
-  row.innerHTML = '';
-  const n = effN();
-  if (S.mode !== 'frames') {
-    row.innerHTML = '<small class="mut">Per-frame durations apply when frames come from a sheet (frame mode). Here the motion is continuous at the FPS above.</small>';
+/* ---------- timeline: proportional blocks, tap to select, drag to retime ---------- */
+function frameThumb(k) {
+  const L = S.layout;
+  if (!L) return null;
+  const c = document.createElement('canvas');
+  const scale = Math.min(2, 72 / Math.max(1, L.H));
+  c.width = Math.max(8, Math.round(L.W * scale));
+  c.height = Math.max(8, Math.round(L.H * scale));
+  const x = c.getContext('2d');
+  if (S.mode === 'frames') {
+    const f = S.frameCrops[k];
+    if (!f) return null;
+    const s = Math.min(c.width / f.w, c.height / f.h);
+    x.drawImage(f.cv, (c.width - f.w * s) / 2, c.height - f.h * s, f.w * s, f.h * s);
+  } else {
+    x.save(); x.scale(scale, scale); drawAt(x, k / Math.max(1, effN())); x.restore();
+  }
+  return c.toDataURL();
+}
+function buildThumbs() { S.thumbs = Array.from({ length: effN() }, (_, k) => frameThumb(k)); }
+function timelineDurs() {
+  const N = effN();
+  return (S.useDurations && S.durations.length === N) ? S.durations : Array(N).fill(Math.round(1000 / S.fps));
+}
+function renderTimeline() {
+  const tl = $('#timeline');
+  const N = effN();
+  if (!S.loaded || !S.layout || !N) {
+    tl.className = 'timeline empty';
+    tl.textContent = S.loaded ? 'No frames in this image' : 'Load a sprite to see its timeline';
     return;
   }
-  if (!S.durations.length || S.durations.length !== n) resetDurations();
-  const disabled = !S.useDurations;
-  $('#durRow').style.opacity = disabled ? '0.4' : '1';
-  for (let i = 0; i < n; i++) {
-    const wrap = document.createElement('label');
-    wrap.style.cssText = 'display:flex;flex-direction:column;align-items:center;font-size:10.5px;color:var(--mut)';
-    wrap.textContent = i + 1;
-    const inp = document.createElement('input');
-    inp.type = 'number'; inp.min = 20; inp.max = 10000; inp.step = 50;
-    inp.value = S.durations[i];
-    inp.disabled = disabled;
-    inp.title = `Frame ${i + 1} duration (ms)`;
-    inp.style.cssText = 'width:62px;background:var(--panel2);color:var(--tx);border:1px solid var(--line);border-radius:7px;padding:4px 5px;font-size:12px';
-    inp.oninput = () => {
-      const v = Math.max(20, Math.min(10000, +inp.value || 100));
-      S.durations[i] = v;
-      S.tMs = Math.min(S.tMs, Math.max(0, totalMs() - 1));
-      syncExportUI(); renderPreview();
-    };
-    wrap.appendChild(inp);
-    row.appendChild(wrap);
+  const durs = timelineDurs();
+  const T = Math.max(1, durs.reduce((a, b) => a + b, 0));
+  const gap = 3, pad = 10;
+  const inner = Math.max(60, tl.clientWidth - pad - (N - 1) * gap);
+  const editable = S.mode === 'frames' && S.useDurations;
+  tl.className = 'timeline';
+  tl.innerHTML = '';
+  for (let k = 0; k < N; k++) {
+    const w = Math.max(42, Math.round(inner * (durs[k] / T)));
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'tl-block' + (k === S.selFrame ? ' sel' : '');
+    b.style.width = w + 'px';
+    b.style.flexBasis = w + 'px';
+    if (S.thumbs[k]) b.style.backgroundImage = `url(${S.thumbs[k]})`;
+    b.dataset.k = k;
+    b.setAttribute('aria-label', `Frame ${k + 1}, ${Math.round(durs[k])} milliseconds`);
+    const num = el('span', 'num', String(k + 1));
+    const ms = el('span', 'ms', Math.round(durs[k]) + ' ms');
+    b.append(num, ms);
+    if (editable) {
+      const h = el('span', 'tl-handle');
+      h.title = 'Drag to change this frame’s duration';
+      b.appendChild(h);
+    }
+    b.addEventListener('click', (e) => {
+      if (e.target.classList.contains('tl-handle')) return;
+      selectFrame(k);
+    });
+    tl.appendChild(b);
   }
+}
+function syncTimelineSel() {
+  $$('#timeline .tl-block').forEach((b) => b.classList.toggle('sel', +b.dataset.k === S.selFrame));
+  const cur = $(`#timeline .tl-block[data-k="${S.selFrame}"]`);
+  if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+function highlightTimeline(idx) {
+  if (idx === S._lastHi) return;
+  S._lastHi = idx;
+  syncTimelineSel();
+}
+function selectFrame(k) {
+  const N = effN();
+  if (!N) return;
+  S.selFrame = clamp(k, 0, N - 1);
+  S.tMs = frameStartMs(S.selFrame);
+  if (S.mode !== 'frames') S.u = S.selFrame / N;
+  S.playing = false;
+  $('#btnPlay').textContent = '▶';
+  buildFrameEditor();
+  syncTimelineSel();
+  renderPreview();
+}
+function buildFrameEditor() {
+  const N = effN();
+  const durs = timelineDurs();
+  const editable = S.mode === 'frames' && S.useDurations;
+  $('#selIdx').textContent = N ? String(S.selFrame + 1) : '–';
+  $('#selTotal').textContent = String(N);
+  const inp = $('#durSel');
+  inp.value = Math.round(durs[S.selFrame] || 0);
+  inp.disabled = !editable;
+  ['#btnDurMinus', '#btnDurPlus', '#btnDurAll', '#btnDurEven', '#btnDurPaste'].forEach((s) => { $(s).disabled = !editable; });
+  $('#tlHint').textContent = N
+    ? `${N} frames · ${(totalMs() / 1000).toFixed(2)} s loop${editable ? ' · tap a frame, drag its right edge to retime' : ''}`
+    : 'load a sprite to begin';
+  $('#durBulk').disabled = !editable;
+}
+function setFrameDuration(k, ms) {
+  const N = effN();
+  if (S.mode !== 'frames') return;
+  if (S.durations.length !== N) resetDurations();
+  S.durations[clamp(k, 0, N - 1)] = clamp(Math.round(ms), 20, 10000);
+  S.tMs = Math.min(S.tMs, Math.max(0, totalMs() - 1));
+  buildFrameEditor();
+  renderTimeline();
+  syncExportUI();
 }
 function syncExportUI() {
   const N = effN();
+  const T = totalMs();
+  const perFrame = S.useDurations && S.durations.length === N && S.mode === 'frames';
   $('#valFps').textContent = S.fps;
-  $('#valN').textContent = S.mode === 'frames' ? N + ' (from image)' : N;
-  $('#rangeN').disabled = S.mode === 'frames';
+  $('#valN').textContent = N;
   $('#rangeCols').max = Math.max(1, N);
   $('#rangeCols').value = Math.min(S.cols, N);
   $('#valCols').textContent = Math.min(S.cols, N);
-  $('#scrub').max = N - 1;
   $('#frameSizeInfo').textContent = S.layout ? `${S.layout.W}×${S.layout.H}px` : '—';
-  const T = totalMs();
-  $('#loopInfo').textContent = S.mode !== 'frames'
-    ? `uniform ${Math.round(1000 / S.fps)} ms/frame · loop ${(T / 1000).toFixed(2)} s`
-    : `loop ${(T / 1000).toFixed(2)} s` +
-      (S.useDurations && S.durations.length === N ? ` (per-frame: ${S.durations.join('/')} ms)` : ` (uniform ${Math.round(1000 / S.fps)} ms)`);
+  // synthetic sampling only matters for single-sprite mode; per-frame timing owns the timeline otherwise
+  $('#nWrap').style.display = S.mode === 'frames' ? 'none' : 'flex';
+  $('#uniformRow').style.display = (S.mode === 'frames' && perFrame) ? 'none' : 'flex';
+  $('#loopInfo').textContent = S.loaded
+    ? `Loop ${(T / 1000).toFixed(2)} s${perFrame ? ` · per-frame timing (${N} entries)` : ` · uniform ${Math.round(1000 / S.fps)} ms/frame`}`
+    : '—';
+  const gifBg = S.backdrop === 'checker'
+    ? (S.hasAlpha ? 'transparent background (alpha preserved)' : 'no alpha to keep — composited as-is')
+    : `composited on ${S.backdrop}`;
+  $('#expMap').textContent = S.layout ? `GIF: ${gifBg} · WebM: ${S.backdrop === 'black' ? 'black' : 'white'} backdrop · Sheet: transparent PNG + JSON timings.` : '';
   $('#expNote').textContent = S.layout
-    ? `${N} frames × ${(T / N).toFixed(0)} ms avg = ${(T / 1000).toFixed(2)} s per loop · sheet ${Math.min(S.cols, N)}×${Math.ceil(N / Math.min(S.cols, N))}` +
-      (S.hasAlpha ? ' · GIF keeps transparency' : '')
+    ? `${N} frames · ${Math.min(S.cols, N)}×${Math.ceil(N / Math.min(S.cols, N))} sheet · GIF delay ${perFrame ? 'per frame' : Math.round(1000 / S.fps) + ' ms'}.`
     : '';
+}
+function setLoaded(on) {
+  S.loaded = !!on;
+  $('#stageHint').classList.toggle('hide', S.loaded);
+  $$('.gateable').forEach((sec) => sec.classList.toggle('off', !S.loaded));
+  if (S.loaded) {
+    $('#btnPlay').disabled = false;
+  } else {
+    $('#btnPlay').disabled = true;
+    $('#pv').setAttribute('aria-label', 'Animation preview — no sprite loaded');
+  }
+}
+/* one call to refresh everything that depends on frames/timing */
+function refreshAll(opts = {}) {
+  if (opts.thumbs) buildThumbs();
+  S.selFrame = clamp(S.selFrame, 0, Math.max(0, effN() - 1));
+  renderTimeline();
+  buildFrameEditor();
+  syncExportUI();
+  applyStage();
 }
 function updateTolVisibility() {
   $('#tolWrap').style.display = S.bgOn && !S.nativeAlpha ? 'flex' : 'none';
@@ -1031,15 +1142,74 @@ function bindUI() {
     if (S.frameSel.length < 2) S.frameSel = [0, 1];
     S.frameSel.sort((a, c) => S.islands[a].x - S.islands[c].x);
     S.preset = 'none'; setPreset('none');
-    buildFrames(); computeLayout(); renderIslands(); syncExportUI(); applyStage();
+    buildFrames(); computeLayout(); setLoaded(true); refreshAll({ thumbs: true });
   };
   $('#btnFramesOff').onclick = () => {
     S.mode = 'single'; S.frameSource = 'islands'; S.frameSel = null; S.frameCrops = [];
-    buildSprite(); computeLayout(); renderIslands(); buildDurations(); syncExportUI(); applyStage();
+    buildSprite(); computeLayout(); renderIslands(); setLoaded(true); refreshAll({ thumbs: true });
   };
-  /* timing + manual grid controls */
-  $('#chkPerFrame').onchange = () => { S.useDurations = $('#chkPerFrame').checked; buildDurations(); syncExportUI(); };
-  $('#btnUniform').onclick = () => { resetDurations(Math.round(1000 / S.fps)); buildDurations(); syncExportUI(); renderPreview(); };
+  /* timing: timeline + selected-frame editor */
+  $('#chkPerFrame').onchange = () => {
+    S.useDurations = $('#chkPerFrame').checked;
+    if (!S.useDurations) resetDurations(Math.round(1000 / S.fps));
+    buildFrameEditor(); renderTimeline(); syncExportUI(); renderPreview();
+  };
+  $('#durSel').oninput = () => setFrameDuration(S.selFrame, +$('#durSel').value || 20);
+  $('#btnDurMinus').onclick = () => setFrameDuration(S.selFrame, (timelineDurs()[S.selFrame] || 0) - 100);
+  $('#btnDurPlus').onclick = () => setFrameDuration(S.selFrame, (timelineDurs()[S.selFrame] || 0) + 100);
+  $('#btnDurAll').onclick = () => {
+    const d = +(($('#durSel').value) || 100);
+    resetDurations(clamp(Math.round(d), 20, 10000));
+    buildFrameEditor(); renderTimeline(); syncExportUI(); renderPreview();
+  };
+  $('#btnDurEven').onclick = () => {
+    const N = effN(); if (!N) return;
+    resetDurations(Math.max(20, Math.round(totalMs() / N)));
+    buildFrameEditor(); renderTimeline(); syncExportUI(); renderPreview();
+  };
+  $('#btnDurPaste').onclick = () => {
+    const parts = ($('#durBulk').value || '').split(/[\s,;]+/).filter(Boolean).map(Number).filter((v) => v > 0);
+    if (!parts.length) { toast('Paste timecodes like 1.5, 1.5, 1, 0.3'); return; }
+    const asMs = parts.every((v) => v <= 20) ? parts.map((v) => v * 1000) : parts;
+    const N = effN();
+    const durs = asMs.slice(0, N);
+    while (durs.length < N) durs.push(durs[durs.length - 1] || Math.round(1000 / S.fps));
+    S.durations = durs.map((v) => clamp(Math.round(v), 20, 10000));
+    S.useDurations = true; $('#chkPerFrame').checked = true;
+    buildFrameEditor(); renderTimeline(); syncExportUI(); renderPreview();
+    toast(`Applied ${parts.length} timecodes · loop ${(totalMs() / 1000).toFixed(2)} s`);
+  };
+  /* timeline interactions: drag a block's right edge to retime, arrow keys to navigate */
+  const tl = $('#timeline');
+  tl.addEventListener('pointerdown', (e) => {
+    const handle = e.target.closest && e.target.closest('.tl-handle');
+    if (!handle) return;
+    const block = handle.closest('.tl-block');
+    if (!block) return;
+    e.preventDefault();
+    const k = +block.dataset.k;
+    const startX = e.clientX;
+    const startMs = timelineDurs()[k];
+    const N = effN();
+    const inner = Math.max(60, tl.clientWidth - 10 - (N - 1) * 3);
+    const T = Math.max(1, totalMs());
+    const perPx = T / inner;
+    handle.setPointerCapture && handle.setPointerCapture(e.pointerId);
+    const move = (ev) => setFrameDuration(k, Math.max(20, Math.round(startMs + (ev.clientX - startX) * perPx)));
+    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  });
+  tl.addEventListener('keydown', (e) => {
+    const N = effN();
+    if (!N) return;
+    if (e.key === 'ArrowRight') { e.preventDefault(); selectFrame((S.selFrame + 1) % N); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); selectFrame((S.selFrame - 1 + N) % N); }
+    else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      setFrameDuration(S.selFrame, (timelineDurs()[S.selFrame] || 0) + (e.key === 'ArrowUp' ? 50 : -50));
+    }
+  });
   const gridInputs = ['#gCols', '#gRows', '#gCw', '#gCh', '#gOx', '#gOy', '#gKeep'];
   function readGrid() {
     S.grid.cols = Math.max(1, Math.min(24, +$('#gCols').value || 1));
@@ -1065,12 +1235,19 @@ function bindUI() {
     const el2 = $(sel);
     el2.onchange = () => { if (!S.orig || S.grid.mode === 'auto') return; readGrid(); sliceGrid(); };
   });
-  $('#btnDemo').onclick = async () => {
+  $('#btnDemo').onclick = () => loadDemo();
+  $('#btnDemo2').onclick = () => loadDemo();
+  $('#btnPick2').onclick = () => fi.click();
+  $('#stageHint').addEventListener('click', (e) => {
+    if (e.target.closest('button')) return;
+    fi.click();
+  });
+  function loadDemo() {
     const b64 = DEMO_B64;
     const bin = atob(b64), u8 = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
     loadBlob(new Blob([u8], { type: 'image/png' }), 'demo-bloop.png');
-  };
+  }
   window.addEventListener('paste', (e) => {
     const it = [...(e.clipboardData || {}).items || []].find((i) => i.type.startsWith('image/'));
     if (it) loadBlob(it.getAsFile(), 'pasted.png');
@@ -1086,20 +1263,11 @@ function bindUI() {
   $('#btnPlay').onclick = () => { S.playing = !S.playing; $('#btnPlay').textContent = S.playing ? '⏸' : '▶'; rafT0 = 0; };
   $('#btnPrev').onclick = () => step(-1);
   $('#btnNext').onclick = () => step(1);
-  $('#scrub').oninput = () => {
-    const k = clamp(+$('#scrub').value | 0, 0, Math.max(0, effN() - 1));
-    S.tMs = frameStartMs(k);
-    if (S.mode === 'frames') S.u = k / Math.max(1, effN());
-    renderPreview();
-  };
   function step(d) {
     const N = effN();
-    const k = S.mode === 'frames'
-      ? clamp(frameAtMs(S.tMs) + d, 0, N - 1)
-      : (Math.floor(S.u * N) + d + N) % N;
-    if (S.mode === 'frames') { S.tMs = frameStartMs(k); S.u = k / N; }
-    else S.u = (S.u + d / N + 1) % 1;
-    $('#scrub').value = k; renderPreview();
+    if (!N) return;
+    const cur = S.mode === 'frames' ? S.selFrame : Math.floor(S.u * N);
+    selectFrame(cur + d);
   }
   $$('#modeSeg button').forEach((b) => {
     b.onclick = () => {
@@ -1107,9 +1275,14 @@ function bindUI() {
       $$('#modeSeg button').forEach((x) => x.classList.toggle('active', x === b));
     };
   });
-  $('#rangeZoom').oninput = () => { S.zoom = +$('#rangeZoom').value; $('#valZoom').textContent = S.zoom + '%'; applyStage(); };
+  $('#btnFit').onclick = () => { S.zoomFit = true; applyStage(); };
+  $('#rangeZoom').oninput = () => {
+    S.zoomFit = false;
+    S.zoom = +$('#rangeZoom').value;
+    applyStage();
+  };
   $('#chkPixel').onchange = () => { S.pixel = $('#chkPixel').checked; applyStage(); };
-  $('#backdrop').onchange = () => { S.backdrop = $('#backdrop').value; applyStage(); };
+  $('#backdrop').onchange = () => { S.backdrop = $('#backdrop').value; applyStage(); syncExportUI(); };
   document.addEventListener('keydown', (e) => {
     if (e.code === 'Space' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'SELECT') {
       e.preventDefault(); $('#btnPlay').click();
@@ -1148,7 +1321,14 @@ function bindUI() {
 function init() {
   bindUI();
   setPreset(S.preset);          // sets defaults + builds the param sliders
-  $('#pvInfo').textContent = 'Drop a sprite or press “Try demo sprite”';
+  // on phones/tablets keep the deep control sections collapsed so the page stays short
+  if (window.matchMedia && window.matchMedia('(max-width: 900px)').matches) {
+    ['#secMotion', '#secExport'].forEach((s) => $(s).removeAttribute('open'));
+  }
+  setLoaded(false);
+  renderTimeline();
+  buildFrameEditor();
+  syncExportUI();
   requestAnimationFrame(frameTick);
 }
 init();
